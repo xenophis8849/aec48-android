@@ -5,9 +5,11 @@
 // aec48-android：模型从库内嵌数据加载（路径 "mem:<名字>" → fmemopen），其余路径照常 fopen。
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 namespace fb { struct MemModel { const char* name; const unsigned char* p; size_t n; };
 inline MemModel* fb_mem_models() { static MemModel m[4] = {}; return m; }
 inline void fb_register_model(const char* name, const unsigned char* p, size_t n) { MemModel* m = fb_mem_models(); for (int i = 0; i < 4; ++i) if (!m[i].name || !strcmp(m[i].name, name)) { m[i] = {name, p, n}; return; } }
+[[noreturn]] inline void fb_fail() { throw std::runtime_error("aec48: model load failed"); }   // 库里不退出宿主进程：由 aec48_create 接住返回 NULL
 inline FILE* fb_open_model(const char* path) {
     if (!strncmp(path, "mem:", 4)) { MemModel* m = fb_mem_models(); for (int i = 0; i < 4; ++i) if (m[i].name && !strcmp(m[i].name, path + 4)) return fmemopen((void*)m[i].p, m[i].n, "rb"); return nullptr; }
     return fopen(path, "rb"); } }
@@ -42,21 +44,21 @@ struct Gtcrn {
     // 缓冲（load 里一次分配）
     std::vector<float> x7, xe, x21, en0, en1, enA, enB, enC, xa, xb, sf, h1, hp, h2, ytmp, xi, gi, gh, ev, od, xp, d3, m2, mF;
 
-    const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "gtcrn: 缺参数 %s\n", k.c_str()); exit(1); } return it->second; }
+    const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "gtcrn: 缺参数 %s\n", k.c_str()); fb_fail(); } return it->second; }
     const float* p(const std::string& k) const { return T(k).v.data(); }
-    static void rd(void* d, size_t sz, size_t n, FILE* f) { if (fread(d, sz, n, f) != n) { fprintf(stderr, "gtcrn: 参数文件截断\n"); exit(1); } }
+    static void rd(void* d, size_t sz, size_t n, FILE* f) { if (fread(d, sz, n, f) != n) { fprintf(stderr, "gtcrn: 参数文件截断\n"); fb_fail(); } }
     void load(const char* path, int nfft, bool rho_ = true, bool res_ = true, float floor_ = 20.f) {
-        FILE* f = fb_open_model(path); if (!f) { perror(path); exit(1); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "gtcrn: 文件格式错\n"); exit(1); }
+        FILE* f = fb_open_model(path); if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "gtcrn: 文件格式错\n"); fb_fail(); }
         for (int i = 0; i < cnt; ++i) { int nl, nd; rd(&nl, 4, 1, f); std::string k(nl, ' '); rd(&k[0], 1, nl, f); rd(&nd, 4, 1, f); Ten t; t.d.resize(nd); if (nd) rd(t.d.data(), 4, nd, f); size_t n = 1; for (int x : t.d) n *= x; t.v.resize(n); if (n) rd(t.v.data(), 4, n, f); P[k] = std::move(t); }
         fclose(f); F = nfft / 2 + 1; rho = rho_; res = res_; floorDb = floor_; NI = rho ? 7 : 6; W = T("en0.w").d[0]; Wh = W / 2;
-        if (T("erb_fc").d[1] != F - F0) { fprintf(stderr, "gtcrn: nfft %d 与参数不符（erb_fc %d 列）\n", nfft, T("erb_fc").d[1]); exit(1); }
-        if (W > 64) { fprintf(stderr, "gtcrn: 宽 %d 超出栈缓冲上限 64\n", W); exit(1); }
+        if (T("erb_fc").d[1] != F - F0) { fprintf(stderr, "gtcrn: nfft %d 与参数不符（erb_fc %d 列）\n", nfft, T("erb_fc").d[1]); fb_fail(); }
+        if (W > 64) { fprintf(stderr, "gtcrn: 宽 %d 超出栈缓冲上限 64\n", W); fb_fail(); }
         erb = p("erb_fc"); ierb = p("ierb_fc");
         auto rng = [](const Ten& t, std::vector<int>& s, std::vector<int>& e) { int R = t.d[0], C = t.d[1]; s.assign(R, 0); e.assign(R, 0); for (int r = 0; r < R; ++r) { int a = C, b = 0; for (int c = 0; c < C; ++c) if (t.v[r * C + c] != 0.f) { a = std::min(a, c); b = c + 1; } s[r] = a < b ? a : 0; e[r] = a < b ? b : 0; } };
         rng(T("erb_fc"), es, ee); rng(T("ierb_fc"), is, ie);
-        auto cb = [&](const char* n, CB& c) { std::string s(n); const Ten& w = T(s + ".w"); c.w = w.v.data(); c.b = p(s + ".b"); c.O = w.d[0]; c.Ig = w.d[1]; c.K = w.d[2]; c.g = (int)T(s + ".g").v[0]; const Ten& a = T(s + ".a"); c.th = a.v.empty(); c.a = c.th ? 0.f : a.v[0]; if (c.K != 5) { fprintf(stderr, "gtcrn: %s 核长 %d≠5\n", n, c.K); exit(1); } };
+        auto cb = [&](const char* n, CB& c) { std::string s(n); const Ten& w = T(s + ".w"); c.w = w.v.data(); c.b = p(s + ".b"); c.O = w.d[0]; c.Ig = w.d[1]; c.K = w.d[2]; c.g = (int)T(s + ".g").v[0]; const Ten& a = T(s + ".a"); c.th = a.v.empty(); c.a = c.th ? 0.f : a.v[0]; if (c.K != 5) { fprintf(stderr, "gtcrn: %s 核长 %d≠5\n", n, c.K); fb_fail(); } };
         cb("en0", en0c); cb("en1", en1c); cb("de3", de3c); cb("de4", de4c);
-        auto gru = [&](const std::string& s, GRU& g) { const Ten& ih = T(s + "ih"); g.ih = ih.v.data(); g.hh = p(s + "hh"); g.bi = p(s + "bi"); g.bh = p(s + "bh"); g.H = ih.d[0] / 3; g.I = ih.d[1]; if (g.H > 64) { fprintf(stderr, "gtcrn: GRU 隐藏 %d 超出上限\n", g.H); exit(1); } };
+        auto gru = [&](const std::string& s, GRU& g) { const Ten& ih = T(s + "ih"); g.ih = ih.v.data(); g.hh = p(s + "hh"); g.bi = p(s + "bi"); g.bh = p(s + "bh"); g.H = ih.d[0] / 3; g.I = ih.d[1]; if (g.H > 64) { fprintf(stderr, "gtcrn: GRU 隐藏 %d 超出上限\n", g.H); fb_fail(); } };
         const char* gn[6] = {"en2", "en3", "en4", "de0", "de1", "de2"};
         for (int i = 0; i < 6; ++i) { std::string s(gn[i]); GT& g = gt_[i]; g.p1w = p(s + ".p1w"); g.p1b = p(s + ".p1b"); g.p1a = T(s + ".p1a").v[0]; g.dw = p(s + ".dw"); g.db = p(s + ".db"); g.da = T(s + ".da").v[0];
             g.p2w = p(s + ".p2w"); g.p2b = p(s + ".p2b"); gru(s + ".tg", g.tg); g.tfw = p(s + ".tfw"); g.tfb = p(s + ".tfb"); g.d = (int)T(s + ".dil").v[0]; g.head = 0; g.cache.assign((size_t)W * 2 * g.d * NB, 0.f); g.h.assign(W, 0.f); }

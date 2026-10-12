@@ -43,19 +43,19 @@ struct NlinD {
     std::vector<float> zero;
     double prof[8] = {0, 0, 0, 0, 0, 0, 0, 0};   // 时延估计 / 卡尔曼+网络 / 帧数 / [先验误差, 特征+网络, 更新]                  // 时延估计 / 卡尔曼+网络 / 帧数
 
-    static void rd(void* d, size_t sz, size_t n, FILE* f) { if (fread(d, sz, n, f) != n) { fprintf(stderr, "nlin: 参数文件截断\n"); exit(1); } }
+    static void rd(void* d, size_t sz, size_t n, FILE* f) { if (fread(d, sz, n, f) != n) { fprintf(stderr, "nlin: 参数文件截断\n"); fb_fail(); } }
     void load(const char* path) {
         std::map<std::string, Ten> Pm;
-        FILE* f = fb_open_model(path); if (!f) { perror(path); exit(1); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "nlin: 文件格式错\n"); exit(1); }
+        FILE* f = fb_open_model(path); if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "nlin: 文件格式错\n"); fb_fail(); }
         for (int i = 0; i < cnt; ++i) { int nl, nd; rd(&nl, 4, 1, f); std::string k(nl, ' '); rd(&k[0], 1, nl, f); rd(&nd, 4, 1, f); Ten tt; tt.d.resize(nd); if (nd) rd(tt.d.data(), 4, nd, f); size_t n = 1; for (int x : tt.d) n *= x; tt.v.resize(n); if (n) rd(tt.v.data(), 4, n, f); Pm[k] = std::move(tt); }
         fclose(f);
-        auto T = [&](const char* k) -> const Ten& { auto it = Pm.find(k); if (it == Pm.end()) { fprintf(stderr, "nlin: 缺参数 %s\n", k); exit(1); } return it->second; };
+        auto T = [&](const char* k) -> const Ten& { auto it = Pm.find(k); if (it == Pm.end()) { fprintf(stderr, "nlin: 缺参数 %s\n", k); fb_fail(); } return it->second; };
         const auto& c = T("nlin.cfg").v; N = (int)c[0]; H = (int)c[1]; L = (int)c[2]; NB = (int)c[3]; HID = (int)c[4]; AK = c[5]; F = N / 2 + 1;
-        if (L != LC) { fprintf(stderr, "nlin: 抽头数 %d≠编译期 %d\n", L, LC); exit(1); }
-        const auto& idx = T("nlin.idx").v; if ((int)idx.size() != F) { fprintf(stderr, "nlin: idx 长度 %zu≠F\n", idx.size()); exit(1); }
+        if (L != LC) { fprintf(stderr, "nlin: 抽头数 %d≠编译期 %d\n", L, LC); fb_fail(); }
+        const auto& idx = T("nlin.idx").v; if ((int)idx.size() != F) { fprintf(stderr, "nlin: idx 长度 %zu≠F\n", idx.size()); fb_fail(); }
         bS.assign(NB, F); bE.assign(NB, 0); for (int k = 0; k < F; ++k) { int b = (int)idx[k]; bS[b] = std::min(bS[b], k); bE[b] = std::max(bE[b], k + 1); }
         ih = T("gru.ih").v; hh = T("gru.hh").v; bi = T("gru.bi").v; bh = T("gru.bh").v; ow = T("out.w").v; ob = T("out.b").v;
-        if ((int)ih.size() != 3 * HID * 5 * NB || (int)ow.size() != 2 * NB * HID) { fprintf(stderr, "nlin: 网络形状不符\n"); exit(1); }
+        if ((int)ih.size() != 3 * HID * 5 * NB || (int)ow.size() != 2 * NB * HID) { fprintf(stderr, "nlin: 网络形状不符\n"); fb_fail(); }
         auto tp = [](const std::vector<float>& w, int R, int C) { std::vector<float> o((size_t)R * C); for (int r = 0; r < R; ++r) for (int c = 0; c < C; ++c) o[(size_t)c * R + r] = w[(size_t)r * C + c]; return o; };
         ihT = tp(ih, 3 * HID, 5 * NB); hhT = tp(hh, 3 * HID, HID); owT = tp(ow, 2 * NB, HID);
         const auto& p = T("tde.par").v; K = (int)p[0]; TA = p[1]; TW = (int)p[2]; THR = p[3]; RATIO = p[4]; HOLD = (int)p[5]; SC = (int)p[6]; AENV = p[7]; ENVDOM = p[8]; ENVHOLD = (int)p[9];
@@ -71,7 +71,7 @@ struct NlinD {
     void reset() {
         t = 0; rxr.assign((size_t)RX * F, 0); rxi.assign((size_t)RX * F, 0); xbr.assign((size_t)RX * NBIN, 0); xbi.assign((size_t)RX * NBIN, 0); pxr.assign(RX, 0); xhd.assign((size_t)RX * NBND, 0);
         Sr.assign((size_t)K * NBIN, 0); Si.assign((size_t)K * NBIN, 0); Sxx.assign((size_t)K * NBIN, 0); Sdd.assign(NBIN, 0); bx.assign(NBND, 0); bd.assign(NBND, 0); xm.assign(NBND, 0); dm.assign(NBND, 0);
-        dbr.assign(NBIN, 0); dbi.assign(NBIN, 0); Renv.assign(K, 0); coh.assign(NBIN, 0); gsc.assign(K, 0); floor_ = FLOOR0d; nact = 0; cur = -1; cand = -1; cn = 0; ecn = 0; ecand = -1;
+        dbr.assign(NBIN, 0); dbi.assign(NBIN, 0); Renv.assign(K, 0); inc.assign(K, 0); coh.assign(NBIN, 0); gsc.assign(K, 0); floor_ = FLOOR0d; nact = 0; cur = -1; cand = -1; cn = 0; ecn = 0; ecand = -1;
         gpk = 0; gcur = 1; gnact = 0; gnst = 0; glast = -1000000000L; gprev = 1.f; gch = 0; lfPrev = 0; lch = 0;
         Wr.assign((size_t)L * F, 0); Wi.assign((size_t)L * F, 0); P.assign((size_t)L * F, 1.f); tmp.assign((size_t)L * F, 0);
         qF.assign(F, 0); cF.assign(F, 0); pe.assign(F, 1e-4f); Yr.assign(F, 0); Yi.assign(F, 0); Er_.assign(F, 0); Ei_.assign(F, 0); pu.assign(F, 0); den.assign(F, 0); xr0.assign(F, 0); xi0.assign(F, 0);
@@ -128,7 +128,7 @@ struct NlinD {
                 int pos = np_; while (pos > 0 && Renv[k] > Renv[pk[pos - 1]]) --pos;
                 if (pos < 3) { for (int z = std::min(np_, 2); z > pos; --z) pk[z] = pk[z - 1]; pk[pos] = k; np_ = std::min(np_ + 1, 3); }
             }
-            inc.assign(K, 0); int ncs = 0;   // 成员缓冲（10-09：static thread_local 在 Android 9（vivo，API 28）上段错误——ELF TLS 要 API 29+）
+            std::fill(inc.begin(), inc.end(), 0); int ncs = 0;   // inc 在 reset() 里按 K 预分配，处理期不再分配   // 成员缓冲（10-09：static thread_local 在 Android 9（vivo，API 28）上段错误——ELF TLS 要 API 29+）
             if (cur < 0 && FULLSTART) { std::fill(inc.begin(), inc.end(), 1); ncs = K; }
             else { auto addc = [&](int c) { for (int j = std::max(0, c - 2); j < std::min(K, c + 3); ++j) if (!inc[j]) { inc[j] = 1; ++ncs; } }; for (int z = 0; z < np_; ++z) addc(pk[z]); if (cur >= 0) addc(cur); }
             if (ncs) {

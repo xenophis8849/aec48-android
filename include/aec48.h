@@ -1,5 +1,5 @@
 /*
- * aec48 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.2 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -25,25 +25,36 @@ extern "C" {
 
 typedef struct Aec48 Aec48;
 
-/* sample_rate：48000 或 44100。frames_per_call：之后每次 process 的样本数（会变就填 0）。失败返回 NULL。 */
+/* sample_rate：48000 或 44100。frames_per_call：之后每次 process 的样本数（会变就填 0）。
+ * 失败（参数不支持、内存不足、模型初始化失败）返回 NULL；库不会退出宿主进程。多线程同时创建多个实例是安全的。 */
 AEC48_EXPORT Aec48* aec48_create(int sample_rate, int frames_per_call);
 
-/* 处理 n 个样本。mic、ref 输入，out 输出（可与 mic 同一块内存）。n 可以是任意正数。返回 0 成功。 */
+/* 处理 n 个样本。mic、ref 输入，out 输出（可与 mic 同一块内存）。n 可以是任意正数（内部按 384 样本分块，长度不受限）。
+ * 返回 0：成功，out 的 n 个样本全部有效。
+ * 返回 1：create 时声明的 frames_per_call 是 384 的整数倍、本次 n 却不是，输出末尾不足的部分补了零（请按声明的块长调用，或创建时填 0）。
+ * 返回 -1：参数无效（空指针或 n ≤ 0）。 */
 AEC48_EXPORT int aec48_process(Aec48* a, const float* mic, const float* ref, float* out, int n);
 
-/* int16 版，同上（内部转 float）。 */
+/* int16 版，同上（内部每 4096 样本一段转 float，长度不受限）。返回值同 aec48_process。 */
 AEC48_EXPORT int aec48_process_s16(Aec48* a, const short* mic, const short* ref, short* out, int n);
 
-/* 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变，便于 A/B 对比）。下一块生效，不清状态。 */
+/* 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变，便于 A/B 对比）。下一块生效。
+ * 关闭期间线性级与掩码照常运行、只是不用其输出，所以切回开时立即是正常状态，无需重新收敛；代价是关闭时算力不省。 */
 AEC48_EXPORT void aec48_set_enabled(Aec48* a, int on);
 
 /* out 相对 mic 的固定延迟（样本数）。 */
 AEC48_EXPORT int aec48_latency_samples(const Aec48* a);
 
-/* 录音：把 mic / ref / out 三路分别写成 16 bit wav 到目录 dir（mic.wav / ref.wav / out.wav，已有的覆盖）。
- * 写文件在库内部的后台线程，不阻塞 process。返回 0 成功。aec48_dump_stop 结束并补好 wav 头。 */
+/* 录音：把 mic / ref / out 三路分别写成 16 bit wav 到目录 dir（mic.wav / ref.wav / out.wav，已有的覆盖），停止时写 meta.json。
+ * 写文件在库内部的后台线程，不阻塞 process。三路按"一次 process 调用"整包写入：后台写不及时时，该次调用的三路一起丢弃，
+ * 丢弃位置记在 meta.json 的 dropped 里，三个文件始终等长、互相对齐（out 比 mic 晚 latency_samples）。
+ * 返回 0 成功；-1 参数无效；-2 文件打不开；-3 内存或线程创建失败。aec48_dump_stop 结束并补好 wav 头（可在任意线程调，会等进行中的 process 写完）。 */
 AEC48_EXPORT int aec48_dump_start(Aec48* a, const char* dir);
 AEC48_EXPORT void aec48_dump_stop(Aec48* a);
+
+/* 上一次录音的写盘结果（在 aec48_dump_stop 之后查）：0 正常；-4 有写盘错误（磁盘满等），meta.json 的 write_error 为 1，
+ * wav 里的样本数只计成功写入的部分。 */
+AEC48_EXPORT int aec48_dump_status(const Aec48* a);
 
 /* 最近一秒的统计：[0] 每块平均处理耗时 ms [1] 最大 ms [2] 已处理样本数 [3] 录音丢块数（后台写不及时） */
 AEC48_EXPORT void aec48_stats(const Aec48* a, double out4[4]);

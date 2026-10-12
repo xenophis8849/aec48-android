@@ -14,8 +14,12 @@ namespace ac {
 typedef std::complex<float> cf;
 
 struct RFft { int N = 0, M = 0; PFFFT_Setup* s = nullptr; float *in = nullptr, *out = nullptr, *wk = nullptr;
-    bool init(int n) { N = n; M = n / 2; s = pffft_new_setup(n, PFFFT_REAL); if (!s) return false;
-        in = (float*)pffft_aligned_malloc(n * 4); out = (float*)pffft_aligned_malloc(n * 4); wk = (float*)pffft_aligned_malloc(n * 4); return true; }
+    RFft() = default; RFft(const RFft&) = delete; RFft& operator=(const RFft&) = delete;
+    ~RFft() { release(); }
+    void release() { if (s) pffft_destroy_setup(s); pffft_aligned_free(in); pffft_aligned_free(out); pffft_aligned_free(wk); s = nullptr; in = out = wk = nullptr; }
+    bool init(int n) { release(); N = n; M = n / 2; s = pffft_new_setup(n, PFFFT_REAL); if (!s) return false;
+        in = (float*)pffft_aligned_malloc(n * 4); out = (float*)pffft_aligned_malloc(n * 4); wk = (float*)pffft_aligned_malloc(n * 4);
+        if (!in || !out || !wk) { release(); return false; } return true; }
     void fwd(const float* x, float* Xr, float* Xi) { memcpy(in, x, N * 4); pffft_transform_ordered(s, in, out, wk, PFFFT_FORWARD);
         Xr[0] = out[0]; Xi[0] = 0.f; Xr[M] = out[1]; Xi[M] = 0.f; for (int k = 1; k < M; ++k) { Xr[k] = out[2 * k]; Xi[k] = out[2 * k + 1]; } }
     void inv(const cf* X, float* x) { in[0] = X[0].real(); in[1] = X[M].real(); for (int k = 1; k < M; ++k) { in[2 * k] = X[k].real(); in[2 * k + 1] = X[k].imag(); }
@@ -54,15 +58,17 @@ struct Chain {
         auto c0 = std::chrono::steady_clock::now();
         lin.step(Xr.data(), Xi.data(), Dr.data(), Di.data(), rh.data() + N - H, Er.data(), Ei.data());   // blk = 窗内最新一跳 = 本块参考
         auto c1 = std::chrono::steady_clock::now(); lastLin = std::chrono::duration<float, std::milli>(c1 - c0).count();
-        if (mode == 2 && hasMask) {
+        // 掩码每帧都跑（含 mode 0 / 1），只按 mode 选输出：A/B 切换时掩码状态始终是新的，切回不需要重新预热；代价是关闭时算力不省
+        if (hasMask) {
             const float g = (float)(GT / (std::sqrt(Pg > 0 ? Pg : 1e-8) + 1e-6));
             double p = 0; for (int b = 0; b < F; ++b) p += (b == 0 || b == F - 1 ? 1.0 : 2.0) * ((double)Er[b] * Er[b] + (double)Ei[b] * Ei[b]); p /= (double)N * N * 0.5;
             for (int b = 0; b < F; ++b) { se[2 * b] = Er[b] * g; se[2 * b + 1] = Ei[b] * g; sy[2 * b] = (Dr[b] - Er[b]) * g; sy[2 * b + 1] = (Di[b] - Ei[b]) * g; }
             cnet.step(se.data(), sy.data(), mo.data());
             const float ig = 1.f / g; for (int b = 0; b < F; ++b) FX[b] = cf(mo[2 * b] * ig, mo[2 * b + 1] * ig);
             if (Pg < 0) { if (p > 1e-8) Pg = p; } else Pg += GA * (p - Pg);
-        } else if (mode == 1 || mode == 2) { for (int b = 0; b < F; ++b) FX[b] = cf(Er[b], Ei[b]); }
-        else { for (int b = 0; b < F; ++b) FX[b] = cf(Dr[b], Di[b]); }
+        }
+        if (mode == 1 || (mode == 2 && !hasMask)) { for (int b = 0; b < F; ++b) FX[b] = cf(Er[b], Ei[b]); }
+        else if (mode == 0) { for (int b = 0; b < F; ++b) FX[b] = cf(Dr[b], Di[b]); }
         lastMask = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - c1).count();
         FX[0] = cf(FX[0].real(), 0); FX[F - 1] = cf(FX[F - 1].real(), 0);
         rf.inv(FX.data(), xw.data());

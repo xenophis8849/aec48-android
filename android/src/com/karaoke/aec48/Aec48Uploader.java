@@ -25,7 +25,9 @@ import java.util.UUID;
  *   device       手机型号（Build.MANUFACTURER + " " + Build.MODEL）
  *   app_version  接入方 App 版本号
  *   file         文件本体（wav 或 json）
- * 成功 = HTTP 2xx。失败的文件保留在目录里，可以下次再调 upload 补传（已成功的会写 .uploaded 标记跳过）。
+ * 成功 = HTTP 2xx。失败的文件保留在目录里，可以下次再调 upload 补传。已成功的文件写 <文件名>.uploaded 标记（内容 = 文件大小与修改时间），
+ * 只有标记与当前文件一致才跳过——同一目录重新录音后旧标记自动失效。四个文件缺任何一个都计为失败（录音不完整不会报成功）。
+ * 建议每次录音用一个新目录。
  * 不能在主线程调用（会做网络请求）。
  */
 public final class Aec48Uploader {
@@ -48,11 +50,13 @@ public final class Aec48Uploader {
         int failed = 0;
         for (String[] t : files) {
             File f = new File(dir, t[1]), mark = new File(dir, t[1] + ".uploaded");
-            if (!f.exists() || mark.exists()) continue;
+            if (!f.isFile()) { failed++; if (cb != null) cb.onFile(t[0], false, "缺文件 " + t[1]); continue; }
+            String stamp = f.length() + ":" + f.lastModified();
+            try { if (mark.exists() && readText(mark).trim().equals(stamp)) continue; } catch (Exception ignored) { }
             try {
                 int code = post(f, t[0], sessionId);
                 boolean ok = code >= 200 && code < 300;
-                if (ok) writeText(mark, String.valueOf(System.currentTimeMillis())); else failed++;
+                if (ok) writeText(mark, stamp); else failed++;
                 if (cb != null) cb.onFile(t[0], ok, "HTTP " + code);
             } catch (Exception e) { failed++; if (cb != null) cb.onFile(t[0], false, e.toString()); }
         }

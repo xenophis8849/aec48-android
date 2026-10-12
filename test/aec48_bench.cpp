@@ -1,5 +1,5 @@
 // 端上测速：按真实节奏（每块 384 样本，48 kHz 下 8 ms）喂数据，量处理线程的 CPU 占用与每块耗时。核心用 taskset 指定。
-// 用法：aec48_bench <mic.pcm> <ref.pcm> <采样率> <秒数> [paced=1]
+// 用法：aec48_bench <mic.pcm> <ref.pcm> <采样率> <秒数> [paced=1] [每次块长=384]
 //   输入不够长就循环；paced=0 时不睡、全速跑（量实时率）。输出一行：CPU 占用 = 处理线程 CPU 时间 / 墙钟时间；每块耗时均值 / p99 / 最大；超时 = 单块超过一个块周期的次数；内存 = 建实例前后与跑完后的常驻内存差。
 #include "aec48.h"
 #include <cstdio>
@@ -16,7 +16,8 @@ static double tcpu() { timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); r
 int main(int argc, char** argv) {
     if (argc < 5) { fprintf(stderr, "用法：%s mic.pcm ref.pcm 采样率 秒数 [paced=1]\n", argv[0]); return 2; }
     auto mic = rd(argv[1]), ref = rd(argv[2]); int sr = atoi(argv[3]); double secs = atof(argv[4]); bool paced = argc < 6 || atoi(argv[5]) != 0;
-    const int B = 384; long nIn = (long)std::min(mic.size(), ref.size()) / B * B, nb = (long)(secs * sr / B);
+    const int B = argc > 6 ? atoi(argv[6]) : 384;   // 10-12：可设 768（每 16 ms 调一次处理两块，摊薄每次唤醒的冷缓存开销）
+    long nIn = (long)std::min(mic.size(), ref.size()) / B * B, nb = (long)(secs * sr / B);
     std::vector<float> m(nIn), r(nIn), o(B); for (long i = 0; i < nIn; ++i) { m[i] = mic[i] / 32768.f; r[i] = ref[i] / 32768.f; }
     long r0 = rss_kb(); Aec48* a = aec48_create(sr, B); if (!a) return 1; long r1 = rss_kb();
     std::vector<double> t(nb); int over = 0; const double per = 1000.0 * B / sr;

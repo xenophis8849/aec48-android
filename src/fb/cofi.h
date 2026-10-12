@@ -25,15 +25,15 @@ struct Cofi {
     const float *erb = nullptr, *ierb = nullptr; std::vector<int> es, ee, is, ie;
     std::vector<float> em, ym, rh, lm, xc0, xc9, xf7, xf21, h1, hd, yt, sk0, sk1, sk2, xf0, xa, xb, xc, xf, gi, gh, yi, z, z2, mF;
 
-    const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "cofi: 缺参数 %s\n", k.c_str()); exit(1); } return it->second; }
+    const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "cofi: 缺参数 %s\n", k.c_str()); fb_fail(); } return it->second; }
     const float* p(const std::string& k) const { return T(k).v.data(); }
-    static void die(const char* m) { fprintf(stderr, "cofi: %s\n", m); exit(1); }
+    static void die(const char* m) { fprintf(stderr, "cofi: %s\n", m); fb_fail(); }
     void gru(const std::string& s, GRU& g) { const Ten& ih = T(s + "ih"); g.ih = ih.v.data(); g.hh = p(s + "hh"); g.bi = p(s + "bi"); g.bh = p(s + "bh"); g.H = ih.d[0] / 3; g.I = ih.d[1]; if (g.H > 64) die("GRU 隐藏超出上限 64"); }
     void load(const char* path, int nfft, float floor_ = 20.f) {
-        FILE* f = fb_open_model(path); if (!f) { perror(path); exit(1); } char mg[4]; int cnt; Gtcrn::rd(mg, 1, 4, f); Gtcrn::rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) die("文件格式错");
+        FILE* f = fb_open_model(path); if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; Gtcrn::rd(mg, 1, 4, f); Gtcrn::rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) die("文件格式错");
         for (int i = 0; i < cnt; ++i) { int nl, nd; Gtcrn::rd(&nl, 4, 1, f); std::string k(nl, ' '); Gtcrn::rd(&k[0], 1, nl, f); Gtcrn::rd(&nd, 4, 1, f); Ten t; t.d.resize(nd); if (nd) Gtcrn::rd(t.d.data(), 4, nd, f); size_t n = 1; for (int x : t.d) n *= x; t.v.resize(n); if (n) Gtcrn::rd(t.v.data(), 4, n, f); P[k] = std::move(t); }
         fclose(f); T("arch_cofi"); F = nfft / 2 + 1; floorDb = floor_;
-        if (T("erb_fc").d[1] != F - F0) { fprintf(stderr, "cofi: nfft %d 与参数不符（erb_fc %d 列）\n", nfft, T("erb_fc").d[1]); exit(1); }
+        if (T("erb_fc").d[1] != F - F0) { fprintf(stderr, "cofi: nfft %d 与参数不符（erb_fc %d 列）\n", nfft, T("erb_fc").d[1]); fb_fail(); }
         erb = p("erb_fc"); ierb = p("ierb_fc");
         auto rng = [](const Ten& t, std::vector<int>& s, std::vector<int>& e) { int R = t.d[0], C = t.d[1]; s.assign(R, 0); e.assign(R, 0); for (int r = 0; r < R; ++r) { int a = C, b = 0; for (int c = 0; c < C; ++c) if (t.v[r * C + c] != 0.f) { a = std::min(a, c); b = c + 1; } s[r] = a < b ? a : 0; e[r] = a < b ? b : 0; } };
         rng(T("erb_fc"), es, ee); rng(T("ierb_fc"), is, ie);
@@ -42,7 +42,7 @@ struct Cofi {
             m.p1w = p1.v.data(); m.p1b = p(s + ".p1b"); m.p1aw = p(s + ".p1aw"); m.p1ab = p(s + ".p1ab"); m.p1s = p(s + ".p1s"); m.C = p1.d[0]; m.Cin = p1.d[1]; m.Fi = T(s + ".p1aw").d[1];
             m.dw = dw.v.data(); m.db = p(s + ".db"); m.kt = dw.d[1]; m.kf = dw.d[2]; m.pf = m.kf / 2; m.daw = p(s + ".daw"); m.dab = p(s + ".dab"); m.ds = p(s + ".ds"); m.Fo = T(s + ".daw").d[1]; m.de = T(s + ".de").v[0] > 0;
             m.p2w = p(s + ".p2w"); m.p2b = p(s + ".p2b"); gru(s + ".tg", m.tg); m.tfw = p(s + ".tfw"); m.tfb = p(s + ".tfb");
-            if (dw.d[0] != m.C || m.kt > 3 || (m.de ? 2 * m.Fi - 1 - 2 * m.pf + m.kf - 1 : (m.Fi + 2 * m.pf - m.kf) / 2 + 1) != m.Fo) { fprintf(stderr, "cofi: %s 形状不符\n", mn[i]); exit(1); }
+            if (dw.d[0] != m.C || m.kt > 3 || (m.de ? 2 * m.Fi - 1 - 2 * m.pf + m.kf - 1 : (m.Fi + 2 * m.pf - m.kf) / 2 + 1) != m.Fo) { fprintf(stderr, "cofi: %s 形状不符\n", mn[i]); fb_fail(); }
             m.head = 0; m.cache.assign((size_t)m.C * std::max(m.kt - 1, 1) * m.Fi, 0.f); m.h.assign(m.tg.H, 0.f); mx = std::max(mx, (size_t)std::max(m.C, m.Cin) * std::max(m.Fi, m.Fo)); }
         const char* rn[4] = {"cr1", "cr2", "fr1", "fr2"};
         for (int i = 0; i < 4; ++i) { std::string s(rn[i]); IR& r = ir_[i]; gru(s + ".g", r.g); r.fw = p(s + ".fw"); r.fb = p(s + ".fb"); r.le = T(s + ".le").v[0]; const Ten& lw = T(s + ".lw"); r.Fn = lw.d[0]; r.C = lw.d[1];

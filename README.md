@@ -63,12 +63,13 @@ aec48_destroy(aec);
 
 | 函数 | 说明 |
 |---|---|
-| `Aec48* aec48_create(int sample_rate, int frames_per_call)` | 建实例。`sample_rate` 只支持 48000、44100。`frames_per_call` 是之后每次 `process` 的样本数；是 384 的整数倍时延迟最低（见下表），不固定就填 0。失败返回 NULL。 |
-| `int aec48_process(Aec48*, const float* mic, const float* ref, float* out, int n)` | 处理 `n` 个样本。float，满幅 ±1.0。`n` 任意正数；`out` 可以和 `mic` 是同一块内存。返回 0 成功。 |
-| `int aec48_process_s16(Aec48*, const short* mic, const short* ref, short* out, int n)` | 16 bit 版，单次 `n` ≤ 8192。 |
-| `void aec48_set_enabled(Aec48*, int on)` | 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变）。下一块生效，不清内部状态，切回开时无需重新收敛。 |
+| `Aec48* aec48_create(int sample_rate, int frames_per_call)` | 建实例。`sample_rate` 只支持 48000、44100。`frames_per_call` 是之后每次 `process` 的样本数；是 384 的整数倍时延迟最低（见下表），不固定就填 0。失败（参数不支持、内存不足、模型初始化失败）返回 NULL，库不会退出宿主进程；多线程同时创建是安全的。 |
+| `int aec48_process(Aec48*, const float* mic, const float* ref, float* out, int n)` | 处理 `n` 个样本。float，满幅 ±1.0。`n` 任意正数，长度不受限（内部按 384 样本分块）；`out` 可以和 `mic` 是同一块内存。返回 0：成功；1：创建时声明的块长是 384 的整数倍、本次 `n` 却不是，输出末尾补了零（按声明块长调用即可避免）；−1：参数无效。 |
+| `int aec48_process_s16(Aec48*, const short* mic, const short* ref, short* out, int n)` | 16 bit 版，长度不受限，返回值同上。 |
+| `void aec48_set_enabled(Aec48*, int on)` | 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变）。下一块生效。关闭期间线性级和残余抑制照常运行、只是不用其输出，所以切回开时立即是正常状态；代价是关闭时算力不省。 |
 | `int aec48_latency_samples(const Aec48*)` | `out` 相对 `mic` 的固定延迟（样本数）。 |
-| `int aec48_dump_start(Aec48*, const char* dir)` / `void aec48_dump_stop(Aec48*)` | 录音：把 mic / ref / out 写成 `dir` 下的 `mic.wav`、`ref.wav`、`out.wav`（16 bit 单声道），停止时另写 `meta.json`。见「录音与上传」。 |
+| `int aec48_dump_start(Aec48*, const char* dir)` / `void aec48_dump_stop(Aec48*)` | 录音：把 mic / ref / out 写成 `dir` 下的 `mic.wav`、`ref.wav`、`out.wav`（16 bit 单声道），停止时另写 `meta.json`。start 返回 0 成功、−1 参数无效、−2 文件打不开、−3 内存或线程创建失败。见「录音与上传」。 |
+| `int aec48_dump_status(const Aec48*)` | 上一次录音的写盘结果（stop 之后查）：0 正常，−4 有写盘错误。 |
 | `void aec48_stats(const Aec48*, double out4[4])` | 最近一秒：[0] 每块平均处理耗时 ms，[1] 最大 ms，[2] 已处理样本数，[3] 录音丢块数。 |
 | `void aec48_destroy(Aec48*)` | 释放（录音中会先停止录音）。 |
 | `const char* aec48_version(void)` | 版本与模型标识。 |
@@ -118,7 +119,9 @@ aec48_dump_stop(aec);
 | `mic.wav` | 麦克风输入 |
 | `ref.wav` | 参考输入 |
 | `out.wav` | 输出（比 mic 晚 `latency_samples` 个样本） |
-| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`start_unix_ms`（开始录音的时刻）、`dump_dropped_blocks`（后台没写及时丢的块，正常应为 0）、`enabled_at_start`、`events`（录音期间 `aec48_set_enabled` 的切换：`{"pos": 样本位置, "enabled": 0/1}`） |
+| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间 `aec48_set_enabled` 的切换：`{"pos": 样本位置, "enabled": 0/1}`）、`dropped` / `dropped_calls`（后台写不及时整包丢弃的位置与次数，正常为空 / 0） |
+
+三路按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的三路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数），所以三个文件始终等长、互相对齐。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，wav 里的样本数只计成功写入的部分。建议每次录音使用一个新目录。
 
 ### 上传（可配置）
 
@@ -136,7 +139,7 @@ new Thread(() -> {
 }).start();                                     // 会做网络请求，不能在主线程
 ```
 
-失败的文件留在目录里，再调一次 `upload` 会补传；已成功的文件会写 `<文件名>.uploaded` 标记并跳过。同一目录多次上传沿用同一个 `session_id`（存在目录里的 `.session_id`）。需要 `INTERNET` 权限。
+四个文件缺任何一个都计为失败（不完整的录音不会报成功）。失败的文件留在目录里，再调一次 `upload` 会补传；已成功的文件写 `<文件名>.uploaded` 标记（内容为文件大小与修改时间），只有标记与当前文件一致才跳过，同一目录重新录音后旧标记自动失效。同一目录多次上传沿用同一个 `session_id`（存在目录里的 `.session_id`）。需要 `INTERNET` 权限。
 
 **接收端请求格式**（每个文件一个请求）：
 
@@ -182,6 +185,12 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 通过标准：整段消除量与期望相差 ≤ 1 dB，且与期望输出的差值能量低 ≥ 20 dB。不同 CPU 的浮点差会让自适应滤波器走出略有不同的轨迹，所以不要求逐样本相同。期望输出与写出的输出都已按延迟挪齐到 mic 的时间轴。测试向量取自公开的 AEC Challenge 盲测集（远端单讲），int16 原始 PCM，单声道。
 
 设置环境变量 `AEC48_DUMP_DIR=<目录>` 时，自检会同时验证录音功能（中途切一次直通，`meta.json` 里应有一条 `events`）。
+
+`test/aec48_robust` 检查接口边界与故障路径（主机与手机都能跑，全部通过返回 0）：反复创建 / 销毁不漏内存；超长单次调用与分块处理逐样本一致；原地处理（`out` = `mic`）；录音中途从另一线程开始 / 停止时三个文件等长；处理期不分配内存；int16 超过 8192 样本；声明块长与实际不符时返回 1；写盘失败时 `aec48_dump_status` = −4；不支持的采样率返回 NULL；多线程并发创建。
+
+```sh
+./build-host/aec48_robust test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm /tmp/aec48_robust_dir
+```
 
 ---
 
@@ -262,7 +271,18 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`aec48 0.1 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：`aec48 0.2 (lin nlinBc3-dual, mask v59ae20)`。
+- 0.2 修改（模型与算法输出不变，三个测试向量结果与 0.1 相同）：
+  - FFT 资源随实例释放（0.1 每次创建 / 销毁泄漏约 25 KB）。
+  - `aec48_process` 长度不受限：0.1 单次超过 32768 样本会静默丢失输出；现在内部分块、边处理边取输出，同址处理安全。
+  - 录音三路整包写入、整包丢弃并记录位置，三个文件始终等长（0.1 中途开始 / 停止或写不及时可能错位）。
+  - 处理期不再分配内存（0.1 时延估计首次决策时有一次分配）。
+  - int16 接口取消 8192 样本上限。
+  - 写盘错误可查（`aec48_dump_status`、`meta.json` 的 `write_error`），样本计数只计成功写入的部分。
+  - 初始化失败统一返回 NULL / 错误码，不再退出宿主进程；内嵌模型只注册一次，多线程并发创建安全。
+  - 关闭回声消除时残余抑制也照常运行，切回开时无需预热。
+  - 上传工具：缺文件计为失败；已上传标记与文件大小、修改时间绑定。
+  - 新增 `test/aec48_robust`。
 - 换模型：把新的模型文件放进 `models/`，运行 `tools/embed_models.py <线性级模型> <掩码模型> "<模型标识>"` 重新生成 `src/models.cpp`，再编译。接口不变。
 
 ---
@@ -273,4 +293,5 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 - 参考里没有的声音（例如其他 App 直接播放、未经本路混音的声音）消不掉。
 - `mic` 与 `ref` 的时间差超过约 1 s 时对不齐。
 - 回声特别强且回声路径变化快的段落可能有残留。
-- 44.1 kHz 已用测试向量验证，48 kHz 已在真机全双工实时运行验证。
+- 44.1 kHz 已用测试向量验证，48 kHz 已在真机全双工实时运行验证。44.1 kHz 下内部时间常数沿用与训练时相同的写法（按帧数计，换算成时间比 48 kHz 长约 9%），效果是否与 48 kHz 等价未单独评估。
+- 只提供 C 接口；Java / Kotlin 直接调用需要自行写 JNI 包装。`example/duplex_example.cpp` 是调用位置示意，省略了错误处理，不能直接用于生产。
