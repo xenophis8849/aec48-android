@@ -46,9 +46,9 @@ struct NlinD {
     static void rd(void* d, size_t sz, size_t n, FILE* f) { if (fread(d, sz, n, f) != n) { fprintf(stderr, "nlin: 参数文件截断\n"); fb_fail(); } }
     void load(const char* path) {
         std::map<std::string, Ten> Pm;
-        FILE* f = fb_open_model(path); if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "nlin: 文件格式错\n"); fb_fail(); }
+        ModelFile mf_(fb_open_model(path)); FILE* f = mf_.f; if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "nlin: 文件格式错\n"); fb_fail(); }
         for (int i = 0; i < cnt; ++i) { int nl, nd; rd(&nl, 4, 1, f); std::string k(nl, ' '); rd(&k[0], 1, nl, f); rd(&nd, 4, 1, f); Ten tt; tt.d.resize(nd); if (nd) rd(tt.d.data(), 4, nd, f); size_t n = 1; for (int x : tt.d) n *= x; tt.v.resize(n); if (n) rd(tt.v.data(), 4, n, f); Pm[k] = std::move(tt); }
-        fclose(f);
+        mf_.close();
         auto T = [&](const char* k) -> const Ten& { auto it = Pm.find(k); if (it == Pm.end()) { fprintf(stderr, "nlin: 缺参数 %s\n", k); fb_fail(); } return it->second; };
         const auto& c = T("nlin.cfg").v; N = (int)c[0]; H = (int)c[1]; L = (int)c[2]; NB = (int)c[3]; HID = (int)c[4]; AK = c[5]; F = N / 2 + 1;
         if (L != LC) { fprintf(stderr, "nlin: 抽头数 %d≠编译期 %d\n", L, LC); fb_fail(); }

@@ -19,16 +19,18 @@ int main(int argc, char** argv) {
     printf("%s · 采样率 %d · 块长 %d · 延迟 %d 样本（%.1f ms）\n", aec48_version(), sr, blk, aec48_latency_samples(a), 1000.0 * aec48_latency_samples(a) / sr);
     if (getenv("AEC48_DUMP_DIR")) printf("测试录音 → %s（rc %d）\n", getenv("AEC48_DUMP_DIR"), aec48_dump_start(a, getenv("AEC48_DUMP_DIR")));   // 自检录音功能
     std::vector<short> out(n, 0); auto t0 = std::chrono::steady_clock::now();
-    for (long i = 0; i + blk <= n; i += blk) { aec48_process_s16(a, &mic[i], &ref[i], &out[i], blk); if (getenv("AEC48_DUMP_DIR") && i < n / 2 && i + blk >= n / 2) aec48_set_enabled(a, 0); }   // 录音自检时中途关一次，验 meta 事件
+    int nPad = 0, nErr = 0;   // 返回 1 = 输出末尾补了零（块长与声明不符），负数 = 出错：都算自检不通过
+    for (long i = 0; i + blk <= n; i += blk) { int pr = aec48_process_s16(a, &mic[i], &ref[i], &out[i], blk); if (pr > 0) ++nPad; else if (pr < 0) ++nErr; if (getenv("AEC48_DUMP_DIR") && i < n / 2 && i + blk >= n / 2) aec48_set_enabled(a, 0); }   // 录音自检时中途关一次，验 meta 事件
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); double st[4]; aec48_stats(a, st);
     long lat = aec48_latency_samples(a), skip = 2L * sr; double e = erle(mic, out, lat, skip);
     std::vector<short> al(n, 0); for (long i = 0; i + lat < n; ++i) al[i] = out[i + lat];   // 挪齐到 mic 的时间轴
     printf("处理 %.1f s 音频用时 %.2f s（实时率 %.3f）；最近一秒每块均 %.3f ms、最大 %.3f ms\n", (double)n / sr, sec, sec / ((double)n / sr), st[0], st[1]);
     printf("整段回声消除（跳过前 2 s）：%.2f dB\n", e);
     int rc = 0;
+    if (nPad || nErr) { printf("process_s16 返回 1（补零）%d 次、出错 %d 次 → 不通过\n", nPad, nErr); rc = 1; }
     if (argc > 4 && argv[4][0] && argv[4][0] != '-') { auto exp = rd(argv[4]); double ee = erle(mic, exp, 0, skip), d = 0, p = 0; long m = std::min((long)exp.size(), n);
         for (long i = skip; i < m - lat; ++i) { double x = (double)al[i] - exp[i]; d += x * x; p += (double)exp[i] * exp[i]; }
-        double rel = 10 * log10((d + 1) / (p + 1)); bool ok = fabs(e - ee) <= 1.0 && rel <= -20; rc = ok ? 0 : 1;
+        double rel = 10 * log10((d + 1) / (p + 1)); bool ok = fabs(e - ee) <= 1.0 && rel <= -20; if (!ok) rc = 1;
         printf("对期望输出：消除量 %.2f vs %.2f dB（差 %+.2f），差值能量 %.1f dB → %s\n", e, ee, e - ee, rel, ok ? "通过" : "不通过"); }
     if (argc > 6) { FILE* f = fopen(argv[6], "wb"); fwrite(al.data(), 2, n, f); fclose(f); }
     aec48_dump_stop(a); aec48_destroy(a); return rc;

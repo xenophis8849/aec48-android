@@ -5,11 +5,11 @@
 #include "gtcrn.h"   // 复用 Ten、ftanh/sigm、pw、sfe、gruGates、gru1、layernorm
 namespace fb {
 static inline bool gtcHasKey(const char* path, const char* key) {   // 不加载全部数据，只扫名字：用于按参数文件选内核
-    FILE* f = fb_open_model(path); if (!f) return false; char mg[4]; int cnt; bool ok = false;
+    ModelFile mf_(fb_open_model(path)); FILE* f = mf_.f; if (!f) return false; char mg[4]; int cnt; bool ok = false;
     if (fread(mg, 1, 4, f) == 4 && !memcmp(mg, "GTC1", 4) && fread(&cnt, 4, 1, f) == 1)
         for (int i = 0; i < cnt && !ok; ++i) { int nl, nd; if (fread(&nl, 4, 1, f) != 1) break; std::string k(nl, ' '); if (fread(&k[0], 1, nl, f) != (size_t)nl || fread(&nd, 4, 1, f) != 1) break;
             std::vector<int> d(nd); if (nd && fread(d.data(), 4, nd, f) != (size_t)nd) break; long n = 1; for (int x : d) n *= x; ok = (k == key); fseek(f, n * 4, SEEK_CUR); }
-    fclose(f); return ok;
+    mf_.close(); return ok;
 }
 
 struct Cofi {
@@ -23,16 +23,16 @@ struct Cofi {
     struct IR { GRU g; const float *fw, *fb; std::vector<float> lw, lb; float le; int C, Fn; std::vector<float> h; };   // h: [C][Fn]
     MB mb_[8]; IR ir_[4]; GRU cg1, cg2; const float *f1w, *f1b, *f2w, *f2b, *clw, *clb; float cle; int H = 0, D = 0; std::vector<float> ch1, ch2;
     const float *erb = nullptr, *ierb = nullptr; std::vector<int> es, ee, is, ie;
-    std::vector<float> em, ym, rh, lm, xc0, xc9, xf7, xf21, h1, hd, yt, sk0, sk1, sk2, xf0, xa, xb, xc, xf, gi, gh, yi, z, z2, mF;
+    std::vector<float> em, ym, rh, lm, xc0, xc9, xf7, xf21, h1, hd, yt, sk0, sk1, sk2, xf0, xa, xb, xc, xf, gi, gh, yi, z, z2, mF; std::vector<float> padr;   // 10-12：深度卷积补零缓冲
 
     const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "cofi: 缺参数 %s\n", k.c_str()); fb_fail(); } return it->second; }
     const float* p(const std::string& k) const { return T(k).v.data(); }
     static void die(const char* m) { fprintf(stderr, "cofi: %s\n", m); fb_fail(); }
     void gru(const std::string& s, GRU& g) { const Ten& ih = T(s + "ih"); g.ih = ih.v.data(); g.hh = p(s + "hh"); g.bi = p(s + "bi"); g.bh = p(s + "bh"); g.H = ih.d[0] / 3; g.I = ih.d[1]; if (g.H > 64) die("GRU 隐藏超出上限 64"); }
     void load(const char* path, int nfft, float floor_ = 20.f) {
-        FILE* f = fb_open_model(path); if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; Gtcrn::rd(mg, 1, 4, f); Gtcrn::rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) die("文件格式错");
+        ModelFile mf_(fb_open_model(path)); FILE* f = mf_.f; if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; Gtcrn::rd(mg, 1, 4, f); Gtcrn::rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) die("文件格式错");
         for (int i = 0; i < cnt; ++i) { int nl, nd; Gtcrn::rd(&nl, 4, 1, f); std::string k(nl, ' '); Gtcrn::rd(&k[0], 1, nl, f); Gtcrn::rd(&nd, 4, 1, f); Ten t; t.d.resize(nd); if (nd) Gtcrn::rd(t.d.data(), 4, nd, f); size_t n = 1; for (int x : t.d) n *= x; t.v.resize(n); if (n) Gtcrn::rd(t.v.data(), 4, n, f); P[k] = std::move(t); }
-        fclose(f); T("arch_cofi"); F = nfft / 2 + 1; floorDb = floor_;
+        mf_.close(); T("arch_cofi"); F = nfft / 2 + 1; floorDb = floor_;
         if (T("erb_fc").d[1] != F - F0) { fprintf(stderr, "cofi: nfft %d 与参数不符（erb_fc %d 列）\n", nfft, T("erb_fc").d[1]); fb_fail(); }
         erb = p("erb_fc"); ierb = p("ierb_fc");
         auto rng = [](const Ten& t, std::vector<int>& s, std::vector<int>& e) { int R = t.d[0], C = t.d[1]; s.assign(R, 0); e.assign(R, 0); for (int r = 0; r < R; ++r) { int a = C, b = 0; for (int c = 0; c < C; ++c) if (t.v[r * C + c] != 0.f) { a = std::min(a, c); b = c + 1; } s[r] = a < b ? a : 0; e[r] = a < b ? b : 0; } };
@@ -57,7 +57,7 @@ struct Cofi {
         gru("cpf.g1", cg1); gru("cpf.g2", cg2); if (cg1.H + cg2.H != H || D != ir_[0].C * ir_[0].Fn + ir_[2].C * ir_[2].Fn) die("CPF 形状不符"); ch1.assign(cg1.H, 0.f); ch2.assign(cg2.H, 0.f);
         em.assign(F, 0); ym.assign(F, 0); rh.assign(F, 0); lm.assign(2 * FL, 0); xc0.assign(3 * FE, 0); xc9.assign(9 * FE, 0); xf7.assign(7 * FL, 0); xf21.assign(21 * FL, 0);
         h1.assign(mx, 0); hd.assign(mx, 0); yt.assign(mx, 0); sk0.assign(mx, 0); sk1.assign(mx, 0); sk2.assign(mx, 0); xf0.assign(mx, 0); xa.assign(mx, 0); xb.assign(mx, 0); xc.assign(mx, 0); xf.assign(mx, 0);
-        gi.assign(3 * mx, 0); gh.assign(3 * mx, 0); yi.assign(mx, 0); z.assign(std::max(H, D), 0); z2.assign(D, 0); mF.assign(F, 0);
+        gi.assign(3 * mx, 0); gh.assign(3 * mx, 0); yi.assign(mx, 0); z.assign(std::max(H, D), 0); z2.assign(D, 0); padr.assign(2 * mx + 16, 0); mF.assign(F, 0);
     }
     void reset() { for (auto& m : mb_) { std::fill(m.cache.begin(), m.cache.end(), 0.f); std::fill(m.h.begin(), m.h.end(), 0.f); m.head = 0; } for (auto& r : ir_) std::fill(r.h.begin(), r.h.end(), 0.f); std::fill(ch1.begin(), ch1.end(), 0.f); std::fill(ch2.begin(), ch2.end(), 0.f); }
 
@@ -74,8 +74,10 @@ struct Cofi {
             const float* rows[3]; for (int t = 0; t < L; ++t) rows[t] = &m.cache[((size_t)c * L + (m.head + t) % L) * Fi]; rows[L] = &h1[c * Fi];   // 时间抽头 t = 0..kt−1（最老 → 当前）
             float* yo = &hd[c * Fo]; const float bv = m.db[c]; for (int f = 0; f < Fo; ++f) yo[f] = bv;
             for (int t = 0; t < kt; ++t) { const float* r = rows[t]; const float* w = m.dw + (c * kt + t) * kf;
-                if (!m.de) { for (int f = 0; f < Fo; ++f) { float a = 0; const int b0 = 2 * f - pf; for (int k = 0; k < kf; ++k) { const int i = b0 + k; if (i >= 0 && i < Fi) a += w[k] * r[i]; } yo[f] += a; } }
-                else { for (int f = 0; f < Fo; ++f) { float a = 0; const int u = f + pf; for (int k = (u & 1); k < kf; k += 2) { const int i = (u - k) >> 1; if (i >= 0 && i < Fi) a += w[k] * r[i]; } yo[f] += a; } } }   // 聚集式：y[u−pf] = Σ_{2i+k=u} x[i]·w[k]
+                // 10-12 落端提速：输入先补零（左 PL、右补足），内层不再逐点判边界（结果与原式相同：越界项原来跳过、现在乘 0）
+                const int PL = kf; float* q = &padr[0]; memset(q, 0, (Fi + 2 * kf + 2) * 4); memcpy(q + PL, r, Fi * 4);
+                if (!m.de) { for (int f = 0; f < Fo; ++f) { float a = 0; const float* qq = q + PL + 2 * f - pf; for (int k = 0; k < kf; ++k) a += w[k] * qq[k]; yo[f] += a; } }
+                else { for (int f = 0; f < Fo; ++f) { float a = 0; const int u = f + pf; for (int k = (u & 1); k < kf; k += 2) a += w[k] * q[PL + ((u - k) >> 1)]; yo[f] += a; } } }   // 聚集式：y[u−pf] = Σ_{2i+k=u} x[i]·w[k]
             if (L > 0) { memcpy(&m.cache[((size_t)c * L + m.head) * Fi], &h1[c * Fi], Fi * 4); } }   // 最老的槽被当前帧覆盖
         if (L > 0) m.head = (m.head + 1) % L;
         aprelu(&hd[0], C, Fo, m.daw, m.dab, m.ds); Gtcrn::pw(m.p2w, m.p2b, &hd[0], y, C, C, Fo);

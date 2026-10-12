@@ -15,7 +15,7 @@
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
-| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/vec/` | 自检程序、端上测速程序、测试向量 |
+| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、上传工具测试、测试向量 |
 | `tools/build_android.sh`、`tools/embed_models.py` | 编译脚本、模型内嵌脚本 |
 | `third_party/pffft/` | FFT 库（BSD 类许可，见其 `LICENSE.txt`） |
 | `LICENSE`、`THIRD_PARTY_NOTICES.md` | 本库许可与第三方声明 |
@@ -120,9 +120,9 @@ aec48_dump_stop(aec);
 | `mic.wav` | 麦克风输入 |
 | `ref.wav` | 参考输入 |
 | `out.wav` | 输出（比 mic 晚 `latency_samples` 个样本） |
-| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间 `aec48_set_enabled` 的切换：`{"pos": 样本位置, "enabled": 0/1}`）、`dropped` / `dropped_calls`（后台写不及时整包丢弃的位置与次数，正常为空 / 0） |
+| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间 `aec48_set_enabled` 的切换：`{"pos": 样本位置, "enabled": 0/1}`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`） |
 
-三路按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的三路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数），所以三个文件始终等长、互相对齐。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，wav 里的样本数只计成功写入的部分。建议每次录音使用一个新目录。
+三路按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的三路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数；紧挨着的几次丢弃合并成一段），所以三个文件始终等长、互相对齐。`dropped` 最多记 1024 段；更多时 `dropped_overflow` 给出 `{"from_pos": 第一个没记下的位置, "calls": 之后的丢弃次数, "samples": 之后丢的样本数}`——`from_pos` 之前的时间轴可以按 `dropped` 完整还原，之后只知道合计。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，已落盘的部分保留，wav 头与 `meta.json` 里的样本数和文件实际内容一致。建议每次录音使用一个新目录。
 
 ### 上传（可配置）
 
@@ -140,7 +140,7 @@ new Thread(() -> {
 }).start();                                     // 会做网络请求，不能在主线程
 ```
 
-四个文件缺任何一个都计为失败（不完整的录音不会报成功）。失败的文件留在目录里，再调一次 `upload` 会补传；已成功的文件写 `<文件名>.uploaded` 标记（内容为文件大小与修改时间），只有标记与当前文件一致才跳过，同一目录重新录音后旧标记自动失效。同一目录多次上传沿用同一个 `session_id`（存在目录里的 `.session_id`）。需要 `INTERNET` 权限。
+四个文件缺任何一个都计为失败（不完整的录音不会报成功）。失败的文件留在目录里，再调一次 `upload` 会补传；已成功的文件写 `<文件名>.uploaded` 标记（内容为 `session_id`、文件大小与内容 CRC32），三者都与这次一致才跳过：同一会话重试只补传失败的文件，换 `session_id` 或同一目录重新录音都会重新上传。同一目录多次上传沿用同一个 `session_id`（存在目录里的 `.session_id`）。需要 `INTERNET` 权限。
 
 **接收端请求格式**（每个文件一个请求）：
 
@@ -187,10 +187,16 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 
 设置环境变量 `AEC48_DUMP_DIR=<目录>` 时，自检会同时验证录音功能（中途切一次直通，`meta.json` 里应有一条 `events`）。
 
-`test/aec48_robust` 检查接口边界与故障路径（主机与手机都能跑，全部通过返回 0）：反复创建 / 销毁不漏内存；超长单次调用与分块处理逐样本一致；原地处理（`out` = `mic`）；录音中途从另一线程开始 / 停止时三个文件等长；处理期不分配内存；int16 超过 8192 样本；声明块长与实际不符时返回 1；写盘失败时 `aec48_dump_status` = −4；不支持的采样率返回 NULL；多线程并发创建。
+`test/aec48_robust` 检查接口边界与故障路径（主机与手机都能跑，全部通过返回 0）：反复创建 / 销毁不漏内存；超长单次调用与分块处理逐样本一致；原地处理（`out` = `mic`）；录音中途从另一线程开始 / 停止时三个文件等长、wav 头与文件一致；处理期不分配内存；int16 超过 8192 样本；int16 大块（4608、12288，含原地）与 float 384 块逐样本一致；声明块长与实际不符时返回 1；写盘失败时 `aec48_dump_status` = −4 且文件长度、wav 头、`meta.json` 三者一致；录音缓冲分配失败返回 −3 且进程不退出；丢弃超过 1024 段时的合并与溢出记录；不支持的采样率返回 NULL；多线程并发创建。主机版用替换 `operator new` 的方式做分配计数与故障注入，第一项会先确认这种替换能拦到库内部的分配。
 
 ```sh
 ./build-host/aec48_robust test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm /tmp/aec48_robust_dir
+```
+
+上传工具的测试（主机上有 JDK 即可，会在本机起一个临时 HTTP 服务）：
+
+```sh
+javac -d /tmp/aec48up android/src/com/karaoke/aec48/Aec48Uploader.java test/Aec48UploaderTest.java && java -cp /tmp/aec48up Aec48UploaderTest
 ```
 
 ---
@@ -205,25 +211,26 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> ./aec48_bench 03ra86gHhkWD_mic.pcm 03ra86gHhkWD_ref.pcm 48000 30 1'
 ```
 
-### 结果（48 kHz，每块 8 ms，回声消除开）
+### 结果（0.3，48 kHz，每块 8 ms，回声消除开）
 
 | 设备（SoC） | 核心 | ABI | 核心占用 | 每块耗时 平均 / p99 / 最大（ms） | 超时块 | 全速实时率 |
 |---|---|---|---|---|---|---|
-| Galaxy S10 SM-G9730（骁龙 855） | 中核 Kryo 485 Gold 2.42 GHz（A76 级） | arm64-v8a | 15.4% | 1.20 / 1.74 / 10.6 | 1 / 3750 | 0.037 |
-| | | armeabi-v7a | 21.5% | 1.70 / 2.12 / 3.16 | 0 | 0.055 |
-| | 小核 Kryo 485 Silver 1.79 GHz（A55 级） | arm64-v8a | 53.9% | 4.45 / 6.57 / 17.1 | 18 / 3750 | 0.211 |
-| | | armeabi-v7a | 68.4% | 5.63 / 7.38 / 15.1 | 17 / 3750 | 0.311 |
-| | 不绑核（系统调度） | arm64-v8a | 54.2% | 4.46 / 6.79 / 15.6 | 23 / 3750 | 0.032 |
-| | | armeabi-v7a | 69.5% | 5.70 / 7.38 / 13.5 | 16 / 3750 | 0.047 |
-| vivo V1934A（Helio P65） | 大核 Cortex-A75 2.0 GHz | arm64-v8a | 23.0% | 1.79 / 1.97 / 2.91 | 0 | 0.110 |
-| | | armeabi-v7a | 25.4% | 1.98 / 2.07 / 2.33 | 0 | 0.123 |
-| | 小核 Cortex-A55 1.7 GHz | arm64-v8a | 56.5% | 4.46 / 4.96 / 5.62 | 0 | 0.315 |
-| | | armeabi-v7a | 71.3% | 5.65 / 6.11 / 7.03 | 0 | 0.407 |
+| Galaxy S10 SM-G9730（骁龙 855） | 中核 Kryo 485 Gold 2.42 GHz（A76 级） | arm64-v8a | 14.7% | 1.17 / 1.52 / 1.9 | 0 | 0.034 |
+| | | armeabi-v7a | 19.2% | 1.53 / 1.96 / 2.2 | 0 | 0.048 |
+| | 小核 Kryo 485 Silver 1.79 GHz（A55 级） | arm64-v8a | 46.8% | 3.89 / 6.28 / 17.2 | 16 / 3750 | 0.178 |
+| | | armeabi-v7a | 62.7% | 5.16 / 7.12 / 19.0 | 26 / 3750 | 0.257 |
+| | 不绑核（系统调度） | arm64-v8a | 46.3% | 3.82 / 6.16 / 16.3 | 14 / 3750 | 0.029 |
+| | | armeabi-v7a | 62.1% | 5.11 / 7.49 / 15.6 | 30 / 3750 | 0.041 |
+| vivo V1934A（Helio P65） | 大核 Cortex-A75 2.0 GHz | arm64-v8a | 19.5% | 1.51 / 1.59 / 1.8 | 0 | 0.099 |
+| | | armeabi-v7a | 23.7% | 1.82 / 1.95 / 2.9 | 0 | 0.115 |
+| | 小核 Cortex-A55 1.7 GHz | arm64-v8a | 50.6% | 3.97 / 4.62 / 5.5 | 0 | 0.273 |
+| | | armeabi-v7a | 64.7% | 5.12 / 5.57 / 6.3 | 0 | 0.354 |
 
 - 内存：每个实例常驻约 5.3–5.7 MB；开录音（`aec48_dump_start`）后另加约 6 MB 录音缓冲（第一次录音时分配）。内嵌模型在库文件里：arm64 1.9 MB、armv7 1.7 MB。
-- S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.032，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
-- 小核上平均耗时约 4.5 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核 0.5%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
-- 64 位比 32 位省 10–25%，优先用 arm64-v8a。
+- S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.029，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
+- 小核上平均耗时约 3.9 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核约 0.4%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
+- 64 位比 32 位省 15–25%，优先用 arm64-v8a。
+- 与 0.2 相比（同设备同测法）：小核占用 S10 53.9% → 46.8%、vivo 56.5% → 50.6%；中 / 大核占用 15.4% → 14.7%、23.0% → 19.5%（arm64）。
 
 ---
 
@@ -272,7 +279,16 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`aec48 0.2 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：`aec48 0.3 (lin nlinBc3-dual, mask v59ae20)`。
+- 0.3 修改（模型不变；三个测试向量结果与 0.2 相同，差值能量在浮点舍入范围内）：
+  - 提速：掩码网络的逐点卷积改为 4 输出通道 × 4 频点一组在寄存器里累加，深度卷积先补零再算（去掉逐点边界判断）。小核每块耗时约降 10–20%，见上面的性能表。
+  - `aec48_process_s16` 不再按 4096 样本内部分段：0.2 在声明块长为 384 的整数倍且单次超过 4096 样本时（如 4608、12288）会插入零样本、打乱时间对齐。现在与 float 版走同一处理循环，输出逐样本一致。
+  - 录音写盘直接写文件描述符、只计确认落盘的字节：写盘出错时 wav 头、`meta.json` 与文件实际内容一致（0.2 会多报缓冲里没写出去的部分）。
+  - 录音用到的缓冲全部在 `aec48_dump_start` 里分配，分配失败返回 −3；写盘线程不再分配内存，也不会让异常逃出线程结束宿主进程。
+  - 丢弃位置表合并相邻段、上限 1024 段，超出时 `meta.json` 给出 `dropped_overflow` 与 `dropped_samples`（0.2 超过 256 条后静默截断）。
+  - 模型加载中途失败时关闭模型流（0.2 会留下未关闭的流）。
+  - 上传工具：已上传标记绑定 `session_id` 与文件内容 CRC32（0.2 只看大小与修改时间，换会话会被旧标记跳过）。
+  - 测试：`aec48_robust` 增加上述各项；`aec48_check` 检查 `process_s16` 返回值；新增 `test/Aec48UploaderTest.java`（主机 Java 即可运行）。
 - 0.2 修改（模型与算法输出不变，三个测试向量结果与 0.1 相同）：
   - FFT 资源随实例释放（0.1 每次创建 / 销毁泄漏约 25 KB）。
   - `aec48_process` 长度不受限：0.1 单次超过 32768 样本会静默丢失输出；现在内部分块、边处理边取输出，同址处理安全。

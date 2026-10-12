@@ -12,7 +12,11 @@ inline void fb_register_model(const char* name, const unsigned char* p, size_t n
 [[noreturn]] inline void fb_fail() { throw std::runtime_error("aec48: model load failed"); }   // 库里不退出宿主进程：由 aec48_create 接住返回 NULL
 inline FILE* fb_open_model(const char* path) {
     if (!strncmp(path, "mem:", 4)) { MemModel* m = fb_mem_models(); for (int i = 0; i < 4; ++i) if (m[i].name && !strcmp(m[i].name, path + 4)) return fmemopen((void*)m[i].p, m[i].n, "rb"); return nullptr; }
-    return fopen(path, "rb"); } }
+    return fopen(path, "rb"); }
+struct ModelFile {   // 模型流的 RAII：解析中途抛异常（截断、缺参数、内存不足）也会关流（审查复查 R-06）
+    FILE* f; explicit ModelFile(FILE* f_) : f(f_) {} ~ModelFile() { if (f) fclose(f); }
+    void close() { if (f) fclose(f); f = nullptr; } ModelFile(const ModelFile&) = delete; ModelFile& operator=(const ModelFile&) = delete; };
+}  // namespace fb
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -48,9 +52,9 @@ struct Gtcrn {
     const float* p(const std::string& k) const { return T(k).v.data(); }
     static void rd(void* d, size_t sz, size_t n, FILE* f) { if (fread(d, sz, n, f) != n) { fprintf(stderr, "gtcrn: 参数文件截断\n"); fb_fail(); } }
     void load(const char* path, int nfft, bool rho_ = true, bool res_ = true, float floor_ = 20.f) {
-        FILE* f = fb_open_model(path); if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "gtcrn: 文件格式错\n"); fb_fail(); }
+        ModelFile mf_(fb_open_model(path)); FILE* f = mf_.f; if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; rd(mg, 1, 4, f); rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) { fprintf(stderr, "gtcrn: 文件格式错\n"); fb_fail(); }
         for (int i = 0; i < cnt; ++i) { int nl, nd; rd(&nl, 4, 1, f); std::string k(nl, ' '); rd(&k[0], 1, nl, f); rd(&nd, 4, 1, f); Ten t; t.d.resize(nd); if (nd) rd(t.d.data(), 4, nd, f); size_t n = 1; for (int x : t.d) n *= x; t.v.resize(n); if (n) rd(t.v.data(), 4, n, f); P[k] = std::move(t); }
-        fclose(f); F = nfft / 2 + 1; rho = rho_; res = res_; floorDb = floor_; NI = rho ? 7 : 6; W = T("en0.w").d[0]; Wh = W / 2;
+        mf_.close(); F = nfft / 2 + 1; rho = rho_; res = res_; floorDb = floor_; NI = rho ? 7 : 6; W = T("en0.w").d[0]; Wh = W / 2;
         if (T("erb_fc").d[1] != F - F0) { fprintf(stderr, "gtcrn: nfft %d 与参数不符（erb_fc %d 列）\n", nfft, T("erb_fc").d[1]); fb_fail(); }
         if (W > 64) { fprintf(stderr, "gtcrn: 宽 %d 超出栈缓冲上限 64\n", W); fb_fail(); }
         erb = p("erb_fc"); ierb = p("ierb_fc");
@@ -85,9 +89,27 @@ struct Gtcrn {
     static inline float sigm(float x) { return 0.5f * ftanh(0.5f * x) + 0.5f; }
     static inline void prelu(float* x, int n, float a) { for (int i = 0; i < n; ++i) { float v = x[i]; x[i] = std::max(v, 0.f) + a * std::min(v, 0.f); } }
     // y[O][N] = w[O][I] · x[I][N] + b
+    // 10-12 落端提速：原写法每乘一个输入通道都把整行输出读出再写回（读写多于计算，vivo 小核实测占整链 17%）。
+    // 改为一次 4 个输出通道 × 4 个频点，累加值留在寄存器里；每个输出元素仍是"偏置 + 按 i 依次累加"，与原式同序。
+    typedef float v4f __attribute__((vector_size(16)));
+    static inline v4f ld4(const float* p) { v4f v; memcpy(&v, p, 16); return v; }
+    static inline void st4(float* p, v4f v) { memcpy(p, &v, 16); }
     static void pw(const float* __restrict w, const float* __restrict b, const float* __restrict x, float* __restrict y, int O, int I, int N) {
-        for (int o = 0; o < O; ++o) { float* __restrict yo = y + o * N; const float bv = b[o]; for (int n = 0; n < N; ++n) yo[n] = bv;
-            const float* wo = w + o * I; for (int i = 0; i < I; ++i) { const float wv = wo[i]; const float* __restrict xi = x + i * N; for (int n = 0; n < N; ++n) yo[n] += wv * xi[n]; } }
+        const int N4 = N & ~3; int o = 0;
+        for (; o + 4 <= O; o += 4) {
+            const float *w0 = w + o * I, *w1 = w0 + I, *w2 = w1 + I, *w3 = w2 + I; float *y0 = y + o * N, *y1 = y0 + N, *y2 = y1 + N, *y3 = y2 + N;
+            for (int n = 0; n < N4; n += 4) {
+                v4f a0 = {b[o], b[o], b[o], b[o]}, a1 = {b[o + 1], b[o + 1], b[o + 1], b[o + 1]}, a2 = {b[o + 2], b[o + 2], b[o + 2], b[o + 2]}, a3 = {b[o + 3], b[o + 3], b[o + 3], b[o + 3]};
+                for (int i = 0; i < I; ++i) { const v4f xv = ld4(x + i * N + n); a0 += w0[i] * xv; a1 += w1[i] * xv; a2 += w2[i] * xv; a3 += w3[i] * xv; }
+                st4(y0 + n, a0); st4(y1 + n, a1); st4(y2 + n, a2); st4(y3 + n, a3);
+            }
+            for (int n = N4; n < N; ++n) { float a0 = b[o], a1 = b[o + 1], a2 = b[o + 2], a3 = b[o + 3];
+                for (int i = 0; i < I; ++i) { const float xv = x[i * N + n]; a0 += w0[i] * xv; a1 += w1[i] * xv; a2 += w2[i] * xv; a3 += w3[i] * xv; }
+                y0[n] = a0; y1[n] = a1; y2[n] = a2; y3[n] = a3; }
+        }
+        for (; o < O; ++o) { const float* wo = w + o * I; float* yo = y + o * N;
+            for (int n = 0; n < N4; n += 4) { v4f a = {b[o], b[o], b[o], b[o]}; for (int i = 0; i < I; ++i) a += wo[i] * ld4(x + i * N + n); st4(yo + n, a); }
+            for (int n = N4; n < N; ++n) { float a = b[o]; for (int i = 0; i < I; ++i) a += wo[i] * x[i * N + n]; yo[n] = a; } }
     }
     static void sfe(const float* x, float* y, int C, int N) {
         for (int c = 0; c < C; ++c) { const float* xc = x + c * N; float* y0 = y + (c * 3) * N; float* y1 = y0 + N; float* y2 = y1 + N;

@@ -1,5 +1,5 @@
 /*
- * aec48 0.2 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.3 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -35,7 +35,7 @@ AEC48_EXPORT Aec48* aec48_create(int sample_rate, int frames_per_call);
  * 返回 -1：参数无效（空指针或 n ≤ 0）。 */
 AEC48_EXPORT int aec48_process(Aec48* a, const float* mic, const float* ref, float* out, int n);
 
-/* int16 版，同上（内部每 4096 样本一段转 float，长度不受限）。返回值同 aec48_process。 */
+/* int16 版，同上（与 float 版同一处理循环，长度不受限、可同址，输出与 float 版逐样本一致）。返回值同 aec48_process。 */
 AEC48_EXPORT int aec48_process_s16(Aec48* a, const short* mic, const short* ref, short* out, int n);
 
 /* 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变，便于 A/B 对比）。下一块生效。
@@ -47,13 +47,14 @@ AEC48_EXPORT int aec48_latency_samples(const Aec48* a);
 
 /* 录音：把 mic / ref / out 三路分别写成 16 bit wav 到目录 dir（mic.wav / ref.wav / out.wav，已有的覆盖），停止时写 meta.json。
  * 写文件在库内部的后台线程，不阻塞 process。三路按"一次 process 调用"整包写入：后台写不及时时，该次调用的三路一起丢弃，
- * 丢弃位置记在 meta.json 的 dropped 里，三个文件始终等长、互相对齐（out 比 mic 晚 latency_samples）。
- * 返回 0 成功；-1 参数无效；-2 文件打不开；-3 内存或线程创建失败。aec48_dump_stop 结束并补好 wav 头（可在任意线程调，会等进行中的 process 写完）。 */
+ * 丢弃位置记在 meta.json 的 dropped 里（相邻的合并成一段），三个文件始终等长、互相对齐（out 比 mic 晚 latency_samples）。
+ * 返回 0 成功；-1 参数无效；-2 文件打不开；-3 内存或线程创建失败（录音用到的内存都在这里分配，失败不会影响宿主进程）。
+ * aec48_dump_stop 结束并补好 wav 头（可在任意线程调，会等进行中的 process 写完）。 */
 AEC48_EXPORT int aec48_dump_start(Aec48* a, const char* dir);
 AEC48_EXPORT void aec48_dump_stop(Aec48* a);
 
-/* 上一次录音的写盘结果（在 aec48_dump_stop 之后查）：0 正常；-4 有写盘错误（磁盘满等），meta.json 的 write_error 为 1，
- * wav 里的样本数只计成功写入的部分。 */
+/* 上一次录音的写盘结果（在 aec48_dump_stop 之后查）：0 正常；-4 有写盘错误（磁盘满等），meta.json 的 write_error 为 1。
+ * 出错时文件保留已经落盘的部分：wav 头与 meta.json 里的样本数 = 文件里实际的样本数（三路可能不等长）。 */
 AEC48_EXPORT int aec48_dump_status(const Aec48* a);
 
 /* 最近一秒的统计：[0] 每块平均处理耗时 ms [1] 最大 ms [2] 已处理样本数 [3] 录音丢块数（后台写不及时） */

@@ -10,6 +10,7 @@ import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.zip.CRC32;
 
 /**
  * 录音上传（aec48_dump_stop 之后调用）：把录音目录里的 mic.wav / ref.wav / out.wav / meta.json 逐个上传。
@@ -25,8 +26,9 @@ import java.util.UUID;
  *   device       手机型号（Build.MANUFACTURER + " " + Build.MODEL）
  *   app_version  接入方 App 版本号
  *   file         文件本体（wav 或 json）
- * 成功 = HTTP 2xx。失败的文件保留在目录里，可以下次再调 upload 补传。已成功的文件写 <文件名>.uploaded 标记（内容 = 文件大小与修改时间），
- * 只有标记与当前文件一致才跳过——同一目录重新录音后旧标记自动失效。四个文件缺任何一个都计为失败（录音不完整不会报成功）。
+ * 成功 = HTTP 2xx。失败的文件保留在目录里，可以下次再调 upload 补传。已成功的文件写 <文件名>.uploaded 标记（内容 = session_id、文件大小与内容 CRC32），
+ * 只有三者都与这次一致才跳过：同一会话重试只补传失败的文件；换一个 session_id 或文件内容变了（同一目录重新录音）都会重新上传。
+ * 四个文件缺任何一个都计为失败（录音不完整不会报成功）。
  * 建议每次录音用一个新目录。
  * 不能在主线程调用（会做网络请求）。
  */
@@ -51,8 +53,10 @@ public final class Aec48Uploader {
         for (String[] t : files) {
             File f = new File(dir, t[1]), mark = new File(dir, t[1] + ".uploaded");
             if (!f.isFile()) { failed++; if (cb != null) cb.onFile(t[0], false, "缺文件 " + t[1]); continue; }
-            String stamp = f.length() + ":" + f.lastModified();
-            try { if (mark.exists() && readText(mark).trim().equals(stamp)) continue; } catch (Exception ignored) { }
+            String stamp;
+            try { stamp = sessionId + "|" + f.length() + "|" + crc32(f); }
+            catch (Exception e) { failed++; if (cb != null) cb.onFile(t[0], false, "读文件失败：" + e); continue; }
+            try { if (mark.exists() && readText(mark).trim().equals(stamp)) { if (cb != null) cb.onFile(t[0], true, "已传过"); continue; } } catch (Exception ignored) { }
             try {
                 int code = post(f, t[0], sessionId);
                 boolean ok = code >= 200 && code < 300;
@@ -83,6 +87,10 @@ public final class Aec48Uploader {
         int code = c.getResponseCode(); c.disconnect(); return code;
     }
 
+    private static String crc32(File f) throws Exception {
+        CRC32 c = new CRC32(); try (InputStream in = new FileInputStream(f)) { byte[] b = new byte[1 << 16]; int n; while ((n = in.read(b)) > 0) c.update(b, 0, n); }
+        return Long.toHexString(c.getValue());
+    }
     private static String readText(File f) throws Exception { try (InputStream in = new FileInputStream(f)) { byte[] b = new byte[(int) f.length()]; int n = in.read(b); return new String(b, 0, Math.max(n, 0), "UTF-8"); } }
     private static void writeText(File f, String s) throws Exception { try (java.io.FileOutputStream o = new java.io.FileOutputStream(f)) { o.write(s.getBytes("UTF-8")); } }
 }
