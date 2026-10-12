@@ -93,7 +93,7 @@ struct Gtcrn {
 
     // ---- 基本算子 ----
     // tanh：Eigen 的 13/6 次有理逼近（全实数轴最大绝对误差 3.3e-7，本机实测）；无 exp、可向量化。sigmoid = 0.5·tanh(x/2)+0.5（误差 2.3e-7）。
-    // 10-08 vivo 实测 GRU 每帧约一万次 exp/tanh 是 DPGRNN 的主要耗时；限幅同时避免 -ffast-math 下 exp 溢出成 NaN（x86 实测过）。
+    // 实测 GRU 每帧约一万次 exp/tanh 是 DPGRNN 的主要耗时；限幅同时避免 -ffast-math 下 exp 溢出成 NaN。
     static inline float ftanh(float x) {
         x = std::min(7.90531110763549805f, std::max(-7.90531110763549805f, x)); const float x2 = x * x;
         float p = x2 * -2.76076847742355e-16f + 2.00018790482477e-13f; p = p * x2 + -8.60467152213735e-11f; p = p * x2 + 5.12229709037114e-08f; p = p * x2 + 1.48572235717979e-05f; p = p * x2 + 6.37261928875436e-04f; p = p * x2 + 4.89352455891786e-03f; p = p * x;
@@ -101,7 +101,7 @@ struct Gtcrn {
     static inline float sigm(float x) { return 0.5f * ftanh(0.5f * x) + 0.5f; }
     static inline void prelu(float* x, int n, float a) { for (int i = 0; i < n; ++i) { float v = x[i]; x[i] = std::max(v, 0.f) + a * std::min(v, 0.f); } }
     // y[O][N] = w[O][I] · x[I][N] + b
-    // 10-12 落端提速：原写法每乘一个输入通道都把整行输出读出再写回（读写多于计算，vivo 小核实测占整链 17%）。
+    // 逐点卷积：原写法每乘一个输入通道都把整行输出读出再写回（读写多于计算，小核上占整链约 17%）。
     // 改为一次 4 个输出通道 × 4 个频点，累加值留在寄存器里；每个输出元素仍是"偏置 + 按 i 依次累加"，与原式同序。
     typedef float v4f __attribute__((vector_size(16)));
     static inline v4f ld4(const float* p) { v4f v; memcpy(&v, p, 16); return v; }

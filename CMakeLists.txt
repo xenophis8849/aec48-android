@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.18)
 project(aec48 C CXX)
 set(CMAKE_CXX_STANDARD 17)
+# 编译产物里不留本机绝对路径（assert / __FILE__ 会把源文件路径写进二进制）
+add_compile_options(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=.)
 add_library(pffft STATIC third_party/pffft/src/pffft.c third_party/pffft/src/pffft_common.c)
 target_include_directories(pffft PUBLIC third_party/pffft/include/pffft)
 set_target_properties(pffft PROPERTIES POSITION_INDEPENDENT_CODE ON)

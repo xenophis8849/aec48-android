@@ -26,7 +26,7 @@ struct Cofi {
     struct IR { GRU g; const float *fw, *fb; std::vector<float> lw, lb; float le; int C, Fn; std::vector<float> h; };   // h: [C][Fn]
     MB mb_[8]; IR ir_[4]; GRU cg1, cg2; const float *f1w, *f1b, *f2w, *f2b, *clw, *clb; float cle; int H = 0, D = 0; std::vector<float> ch1, ch2;
     const float *erb = nullptr, *ierb = nullptr; std::vector<int> es, ee, is, ie;
-    std::vector<float> em, ym, rh, lm, xc0, xc9, xf7, xf21, h1, hd, yt, sk0, sk1, sk2, xf0, xa, xb, xc, xf, gi, gh, yi, z, z2, mF; std::vector<float> padr;   // 10-12：深度卷积补零缓冲
+    std::vector<float> em, ym, rh, lm, xc0, xc9, xf7, xf21, h1, hd, yt, sk0, sk1, sk2, xf0, xa, xb, xc, xf, gi, gh, yi, z, z2, mF; std::vector<float> padr;   // 深度卷积补零缓冲
 
     const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "cofi: 缺参数 %s\n", k.c_str()); fb_fail(); } return it->second; }
     const float* p(const std::string& k) const { return T(k).v.data(); }
@@ -82,7 +82,7 @@ struct Cofi {
             const float* rows[3]; for (int t = 0; t < L; ++t) rows[t] = &m.cache[((size_t)c * L + (m.head + t) % L) * Fi]; rows[L] = &h1[c * Fi];   // 时间抽头 t = 0..kt−1（最老 → 当前）
             float* yo = &hd[c * Fo]; const float bv = m.db[c]; for (int f = 0; f < Fo; ++f) yo[f] = bv;
             for (int t = 0; t < kt; ++t) { const float* r = rows[t]; const float* w = m.dw + (c * kt + t) * kf;
-                // 10-12 落端提速：输入先补零（左 PL、右补足），内层不再逐点判边界（结果与原式相同：越界项原来跳过、现在乘 0）
+                // 输入先补零（左 PL、右补足），内层不再逐点判边界（结果与原式相同：越界项原来跳过、现在乘 0）
                 const int PL = kf; float* q = &padr[0]; memset(q, 0, (Fi + 2 * kf + 2) * 4); memcpy(q + PL, r, Fi * 4);
                 if (!m.de) { for (int f = 0; f < Fo; ++f) { float a = 0; const float* qq = q + PL + 2 * f - pf; for (int k = 0; k < kf; ++k) a += w[k] * qq[k]; yo[f] += a; } }
                 else { for (int f = 0; f < Fo; ++f) { float a = 0; const int u = f + pf; for (int k = (u & 1); k < kf; k += 2) a += w[k] * q[PL + ((u - k) >> 1)]; yo[f] += a; } } }   // 聚集式：y[u−pf] = Σ_{2i+k=u} x[i]·w[k]

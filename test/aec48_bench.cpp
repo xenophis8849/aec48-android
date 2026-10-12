@@ -17,7 +17,7 @@ static double tcpu() { timespec t; clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t); r
 int main(int argc, char** argv) {
     if (argc < 5) { fprintf(stderr, "用法：%s mic.pcm ref.pcm 采样率 秒数 [paced=1]\n", argv[0]); return 2; }
     auto mic = rd(argv[1]), ref = rd(argv[2]); int sr = atoi(argv[3]); double secs = atof(argv[4]); bool paced = argc < 6 || atoi(argv[5]) != 0;
-    const int B = argc > 6 ? atoi(argv[6]) : 384;   // 10-12：可设 768（每 16 ms 调一次处理两块，摊薄每次唤醒的冷缓存开销）
+    const int B = argc > 6 ? atoi(argv[6]) : 384;   // 可设 768 等（每次调用处理多块）
     long nIn = (long)std::min(mic.size(), ref.size()) / B * B, nb = (long)(secs * sr / B);
     std::vector<float> m(nIn), r(nIn), o(B); for (long i = 0; i < nIn; ++i) { m[i] = mic[i] / 32768.f; r[i] = ref[i] / 32768.f; }
     long r0 = rss_kb(); Aec48* a = aec48_create(sr, B); if (!a) return 1; long r1 = rss_kb();

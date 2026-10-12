@@ -15,7 +15,7 @@
 namespace fb {
 
 #ifndef NLIN_TDE_T
-#define NLIN_TDE_T double   // 时延估计累加精度：double = 与 Python（float64）逐帧一致（核对版）；10-10 手机/测速版用 float（build_chain_d.sh），盲测 800 条 1 条分歧（近端单讲，消除量无差）
+#define NLIN_TDE_T double   // 时延估计累加精度：double = 与参照实现（float64）逐帧一致（核对用）；本库按 float 编（盲测集上与 double 版只在极个别近端单讲片段的时延判定不同，消除量无差）
 #endif
 typedef NLIN_TDE_T tdT;
 struct NlinD {
@@ -34,7 +34,7 @@ struct NlinD {
     double gpk = 0, gcur = 1, gdec = 0; int gnact = 0, gnst = 0; long glast = -1000000000L; float gprev = 1.f; int gch = 0;
     int lfPrev = 0, lch = 0;
     std::vector<float> Wr, Wi, P, tmp;           // [L][F]
-    // 10-10 双滤波器（nlin.dual_select）：经典版（c = q = 1）同回归量、同复位另跑一套，逐频点比一阶平滑误差功率，经典版小 DUAL_MARGIN dB 以上才取经典版
+    // 双滤波器：经典版（c = q = 1）同回归量、同复位另跑一套，逐频点比一阶平滑误差功率，经典版小 DUAL_MARGIN dB 以上才取经典版
     bool dual = false; double dualAd = 0, dualMd = 0;
     std::vector<float> Wcr, Wci, Pc, pec, Ecr, Eci, oneB; std::vector<double> sEn, sEc;   // 平滑误差功率用 double（= Python lfilter float64；近门槛处选路才与规格一致）
     std::vector<float> qF, cF, pe, Yr, Yi, Er_, Ei_, pu, den, ft, h, gx, gh, o, cB, qB, xr0, xi0;
@@ -128,7 +128,7 @@ struct NlinD {
                 int pos = np_; while (pos > 0 && Renv[k] > Renv[pk[pos - 1]]) --pos;
                 if (pos < 3) { for (int z = std::min(np_, 2); z > pos; --z) pk[z] = pk[z - 1]; pk[pos] = k; np_ = std::min(np_ + 1, 3); }
             }
-            std::fill(inc.begin(), inc.end(), 0); int ncs = 0;   // inc 在 reset() 里按 K 预分配，处理期不再分配   // 成员缓冲（10-09：static thread_local 在 Android 9（vivo，API 28）上段错误——ELF TLS 要 API 29+）
+            std::fill(inc.begin(), inc.end(), 0); int ncs = 0;   // inc 在 reset() 里按 K 预分配，处理期不再分配   // 用成员缓冲而不是 static thread_local（ELF TLS 要 API 29+，旧系统上会段错误）
             if (cur < 0 && FULLSTART) { std::fill(inc.begin(), inc.end(), 1); ncs = K; }
             else { auto addc = [&](int c) { for (int j = std::max(0, c - 2); j < std::min(K, c + 3); ++j) if (!inc[j]) { inc[j] = 1; ++ncs; } }; for (int z = 0; z < np_; ++z) addc(pk[z]); if (cur >= 0) addc(cur); }
             if (ncs) {
@@ -156,7 +156,8 @@ struct NlinD {
         return cur;
     }
 
-    static inline float sigm(float x) { return 1.f / (1.f + expf(-x)); }
+    // 参数先限到 [−80, 80]，expf 不会溢出：-O3 -ffast-math 下 glibc 可能换成不处理溢出的向量版 expf
+    static inline float sigm(float x) { x = x < -80.f ? -80.f : (x > 80.f ? 80.f : x); return 1.f / (1.f + expf(-x)); }
 
     void kf(std::vector<float>& Wr_, std::vector<float>& Wi_, std::vector<float>& P_, const std::vector<float>& pe_, const std::vector<float>& Er, const std::vector<float>& Ei, const float* cb, const float* qb, float g) {
         const float A2 = AK * AK, Aq = 1 - AK * AK;
@@ -221,7 +222,7 @@ struct NlinD {
         }
         auto cA = std::chrono::steady_clock::now();
         // ---- 网络：频带特征 → GRUCell → c、q ----
-        // 10-09 提速：频带和用 float（= Python 的 float32 矩阵乘）；GRU/输出层权重已转置成 [输入][行]，按列累加（每步 192/64 个连续行，NEON 友好）
+        // 频带和用 float（= 参照实现的 float32 矩阵乘）；GRU/输出层权重已转置成 [输入][行]，按列累加（每步 192/64 个连续行，NEON 友好）
         for (int b = 0; b < NB; ++b) {
             float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0; const float* x0r = tr[0]; const float* x0i = ti[0];
             for (int k = bS[b]; k < bE[b]; ++k) { const float a = x0r[k] * g, c = x0i[k] * g; s0 += a * a + c * c; s1 += pu[k]; s2 += Dr[k] * Dr[k] + Di[k] * Di[k]; s3 += Er_[k] * Er_[k] + Ei_[k] * Ei_[k]; s4 += Yr[k] * Yr[k] + Yi[k] * Yi[k]; }
