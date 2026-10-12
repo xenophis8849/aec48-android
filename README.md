@@ -193,6 +193,8 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 ./build-host/aec48_robust test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm /tmp/aec48_robust_dir
 ```
 
+也可以用 ThreadSanitizer 构建跑这个测试查线程竞态（`-DCMAKE_CXX_FLAGS=-fsanitize=thread` 等，0.3 无告警）。
+
 上传工具的测试（主机上有 JDK 即可，会在本机起一个临时 HTTP 服务）：
 
 ```sh
@@ -230,6 +232,7 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 - S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.029，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
 - 小核上平均耗时约 3.9 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核约 0.4%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
 - 64 位比 32 位省 15–25%，优先用 arm64-v8a。
+- 边录音边处理（`AEC48_DUMP_DIR` 设给 `aec48_bench`，写盘线程与处理绑在同一个小核上，按真实节奏 300 s）：S10 超时块 0.46% → 0.57%、平均耗时 3.95 → 4.13 ms；vivo 超时块 9 → 3 次（无差别）；两台都没有丢弃，三个文件等长。
 - 与 0.2 相比（同设备同测法）：小核占用 S10 53.9% → 46.8%、vivo 56.5% → 50.6%；中 / 大核占用 15.4% → 14.7%、23.0% → 19.5%（arm64）。
 
 ---

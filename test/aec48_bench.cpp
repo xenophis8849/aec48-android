@@ -1,6 +1,7 @@
 // 端上测速：按真实节奏（每块 384 样本，48 kHz 下 8 ms）喂数据，量处理线程的 CPU 占用与每块耗时。核心用 taskset 指定。
 // 用法：aec48_bench <mic.pcm> <ref.pcm> <采样率> <秒数> [paced=1] [每次块长=384]
 //   输入不够长就循环；paced=0 时不睡、全速跑（量实时率）。输出一行：CPU 占用 = 处理线程 CPU 时间 / 墙钟时间；每块耗时均值 / p99 / 最大；超时 = 单块超过一个块周期的次数；内存 = 建实例前后与跑完后的常驻内存差。
+//   设了环境变量 AEC48_DUMP_DIR=<目录> 时同时录音（写盘线程与处理在同一组核心上），末尾多输出一行录音结果（开始返回值、写盘状态、丢弃次数）。
 #include "aec48.h"
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@ int main(int argc, char** argv) {
     long nIn = (long)std::min(mic.size(), ref.size()) / B * B, nb = (long)(secs * sr / B);
     std::vector<float> m(nIn), r(nIn), o(B); for (long i = 0; i < nIn; ++i) { m[i] = mic[i] / 32768.f; r[i] = ref[i] / 32768.f; }
     long r0 = rss_kb(); Aec48* a = aec48_create(sr, B); if (!a) return 1; long r1 = rss_kb();
+    const char* dd = getenv("AEC48_DUMP_DIR"); int drc = dd ? aec48_dump_start(a, dd) : 1;   // 设了 AEC48_DUMP_DIR 就边录音边测（录音写盘在库内后台线程）
     std::vector<double> t(nb); int over = 0; const double per = 1000.0 * B / sr;
     auto w0 = std::chrono::steady_clock::now(); double c0 = tcpu(); auto next = w0;
     for (long k = 0; k < nb; ++k) {
@@ -32,5 +34,6 @@ int main(int argc, char** argv) {
     std::vector<double> s = t; std::sort(s.begin(), s.end()); double mean = 0; for (double x : t) mean += x; mean /= nb;
     printf("{\"paced\":%d,\"sec\":%.1f,\"blocks\":%ld,\"cpu_pct\":%.2f,\"rtf\":%.4f,\"mean_ms\":%.3f,\"p99_ms\":%.3f,\"max_ms\":%.3f,\"over\":%d,\"rss_create_kb\":%ld,\"rss_run_kb\":%ld}\n",
            paced, wall, nb, 100.0 * cpu / wall, mean / per, mean, s[(size_t)(0.99 * (nb - 1))], s.back(), over, r1 - r0, r2 - r0);
+    if (dd) { double st[4]; aec48_stats(a, st); aec48_dump_stop(a); printf("{\"dump_start\":%d,\"dump_status\":%d,\"dropped_calls\":%.0f}\n", drc, aec48_dump_status(a), st[3]); }
     aec48_destroy(a); return 0;
 }
