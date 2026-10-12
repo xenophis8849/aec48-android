@@ -18,6 +18,7 @@
 | `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/vec/` | 自检程序、端上测速程序、测试向量 |
 | `tools/build_android.sh`、`tools/embed_models.py` | 编译脚本、模型内嵌脚本 |
 | `third_party/pffft/` | FFT 库（BSD 类许可，见其 `LICENSE.txt`） |
+| `LICENSE`、`THIRD_PARTY_NOTICES.md` | 本库许可与第三方声明 |
 
 ---
 
@@ -284,6 +285,14 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
   - 上传工具：缺文件计为失败；已上传标记与文件大小、修改时间绑定。
   - 新增 `test/aec48_robust`。
 - 换模型：把新的模型文件放进 `models/`，运行 `tools/embed_models.py <线性级模型> <掩码模型> "<模型标识>"` 重新生成 `src/models.cpp`，再编译。接口不变。
+
+---
+
+## 许可
+
+本库源码、模型权重与预编译库不开源，见 [`LICENSE`](LICENSE)。第三方部分（pffft、测试向量）按各自条款，见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+**集成方注意：** `libaec48.so` 静态链接了 pffft，分发带这个库的 App 时，要在 App 的开源许可 / 第三方声明页面里附上 `THIRD_PARTY_NOTICES.md` 中 pffft 那一段。
 
 ---
 
