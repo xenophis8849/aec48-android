@@ -2,7 +2,8 @@
 // 权重在 load() 里一次定位，每帧不查名字、不分配内存。
 // 激活一律 [通道][频率] 行主序。用法：fb::Gtcrn g; g.load("model.gtc", nfft); g.step(se, sy, out);  se/sy/out = 2F 个 float（实、虚交错）。
 #pragma once
-// aec48-android：模型从库内嵌数据加载（路径 "mem:<名字>" → fmemopen），其余路径照常 fopen。
+// aec48-android：模型从库内嵌数据加载（路径 "mem:<名字>" → 内存只读流），其余路径照常 fopen。
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -10,8 +11,19 @@ namespace fb { struct MemModel { const char* name; const unsigned char* p; size_
 inline MemModel* fb_mem_models() { static MemModel m[4] = {}; return m; }
 inline void fb_register_model(const char* name, const unsigned char* p, size_t n) { MemModel* m = fb_mem_models(); for (int i = 0; i < 4; ++i) if (!m[i].name || !strcmp(m[i].name, name)) { m[i] = {name, p, n}; return; } }
 [[noreturn]] inline void fb_fail() { throw std::runtime_error("aec48: model load failed"); }   // 库里不退出宿主进程：由 aec48_create 接住返回 NULL
+// 内存里的模型当只读 FILE* 用。Android 用 funopen（各版本都有；fmemopen 要 API 23），其余平台用 fmemopen。
+#if defined(__ANDROID__)
+struct MemCur { const unsigned char* p; size_t n, pos; };
+inline int memRead(void* c, char* buf, int k) { MemCur* m = (MemCur*)c; size_t r = m->n - m->pos; if ((size_t)k < r) r = (size_t)k; memcpy(buf, m->p + m->pos, r); m->pos += r; return (int)r; }
+inline fpos_t memSeek(void* c, fpos_t off, int wh) { MemCur* m = (MemCur*)c; long long b = wh == SEEK_SET ? 0 : wh == SEEK_CUR ? (long long)m->pos : (long long)m->n, q = b + (long long)off;
+    if (q < 0 || q > (long long)m->n) { errno = EINVAL; return (fpos_t)-1; } m->pos = (size_t)q; return (fpos_t)q; }
+inline int memClose(void* c) { delete (MemCur*)c; return 0; }
+inline FILE* fb_mem_open(const unsigned char* p, size_t n) { MemCur* c = new MemCur{p, n, 0}; FILE* f = funopen(c, memRead, nullptr, memSeek, memClose); if (!f) delete c; return f; }
+#else
+inline FILE* fb_mem_open(const unsigned char* p, size_t n) { return fmemopen((void*)p, n, "rb"); }
+#endif
 inline FILE* fb_open_model(const char* path) {
-    if (!strncmp(path, "mem:", 4)) { MemModel* m = fb_mem_models(); for (int i = 0; i < 4; ++i) if (m[i].name && !strcmp(m[i].name, path + 4)) return fmemopen((void*)m[i].p, m[i].n, "rb"); return nullptr; }
+    if (!strncmp(path, "mem:", 4)) { MemModel* m = fb_mem_models(); for (int i = 0; i < 4; ++i) if (m[i].name && !strcmp(m[i].name, path + 4)) return fb_mem_open(m[i].p, m[i].n); return nullptr; }
     return fopen(path, "rb"); }
 struct ModelFile {   // 模型流的 RAII：解析中途抛异常（截断、缺参数、内存不足）也会关流（审查复查 R-06）
     FILE* f; explicit ModelFile(FILE* f_) : f(f_) {} ~ModelFile() { if (f) fclose(f); }

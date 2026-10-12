@@ -3,6 +3,9 @@
 // 用法：fb::Cofi m; m.load("mask.gtc", nfft); m.step(se, sy, out);  se/sy/out = 2F 个 float（实、虚交错）。
 #pragma once
 #include "gtcrn.h"   // 复用 Ten、ftanh/sigm、pw、sfe、gruGates、gru1、layernorm
+#ifdef COFI_Q8
+#include "q8.h"   // CPF 两个全连接用 int8（Arm KleidiAI 量化方式与内核）
+#endif
 namespace fb {
 static inline bool gtcHasKey(const char* path, const char* key) {   // 不加载全部数据，只扫名字：用于按参数文件选内核
     ModelFile mf_(fb_open_model(path)); FILE* f = mf_.f; if (!f) return false; char mg[4]; int cnt; bool ok = false;
@@ -53,7 +56,12 @@ struct Cofi {
 #ifdef COFI_W16
         { const Ten& t1 = T("cpf.f1w"); f1h.assign(t1.v.begin(), t1.v.end()); const Ten& t2 = T("cpf.f2w"); f2h.assign(t2.v.begin(), t2.v.end()); }
 #endif
-        f2b = p("cpf.f2b"); clw = p("cpf.lw"); clb = p("cpf.lb"); cle = T("cpf.le").v[0]; H = T("cpf.f1w").d[0]; D = T("cpf.f1w").d[1];
+        f2b = p("cpf.f2b");
+#ifdef COFI_Q8
+        q1.init(T("cpf.f1w").v.data(), T("cpf.f1b").v.data(), T("cpf.f1w").d[0], T("cpf.f1w").d[1]); q2.init(T("cpf.f2w").v.data(), T("cpf.f2b").v.data(), T("cpf.f2w").d[0], T("cpf.f2w").d[1]);
+        qcat.assign(T("cpf.f1w").d[1], 0.f);
+#endif
+        clw = p("cpf.lw"); clb = p("cpf.lb"); cle = T("cpf.le").v[0]; H = T("cpf.f1w").d[0]; D = T("cpf.f1w").d[1];
         gru("cpf.g1", cg1); gru("cpf.g2", cg2); if (cg1.H + cg2.H != H || D != ir_[0].C * ir_[0].Fn + ir_[2].C * ir_[2].Fn) die("CPF 形状不符"); ch1.assign(cg1.H, 0.f); ch2.assign(cg2.H, 0.f);
         em.assign(F, 0); ym.assign(F, 0); rh.assign(F, 0); lm.assign(2 * FL, 0); xc0.assign(3 * FE, 0); xc9.assign(9 * FE, 0); xf7.assign(7 * FL, 0); xf21.assign(21 * FL, 0);
         h1.assign(mx, 0); hd.assign(mx, 0); yt.assign(mx, 0); sk0.assign(mx, 0); sk1.assign(mx, 0); sk2.assign(mx, 0); xf0.assign(mx, 0); xa.assign(mx, 0); xb.assign(mx, 0); xc.assign(mx, 0); xf.assign(mx, 0);
@@ -98,6 +106,18 @@ struct Cofi {
 #ifdef COFI_W16
     std::vector<__fp16> f1h, f2h;   // 实验：CPF 两个全连接层权重半精度存储（读内存减半）
 #endif
+#ifdef COFI_Q8
+    q8::QMat q1, q2; std::vector<float> qcat;
+    void cpf(float* a, int na, float* b, int nb) {
+        memcpy(&qcat[0], a, na * 4); memcpy(&qcat[na], b, nb * 4);
+        q8::gemv(q1, &qcat[0], &z[0]);
+        Gtcrn::layernorm(&z[0], H, clw, clb, cle); for (int h = 0; h < H; ++h) z[h] = z[h] > 0 ? z[h] : std::expm1(z[h]);
+        Gtcrn::gru1(cg1, &z[0], nullptr, &ch1[0]); Gtcrn::gru1(cg2, &z[cg1.H], nullptr, &ch2[0]);
+        for (int h = 0; h < cg1.H; ++h) z[h] = ch1[h]; for (int h = 0; h < cg2.H; ++h) z[cg1.H + h] = ch2[h];
+        q8::gemv(q2, &z[0], &z2[0]);
+        for (int i = 0; i < na; ++i) a[i] += z2[i]; for (int i = 0; i < nb; ++i) b[i] += z2[na + i];
+    }
+#else
     void cpf(float* a, int na, float* b, int nb) {
 #ifdef COFI_W16
         for (int h = 0; h < H; ++h) { float s = f1b[h]; const __fp16* w = &f1h[(size_t)h * D];
@@ -115,6 +135,7 @@ struct Cofi {
 #endif
         for (int i = 0; i < na; ++i) a[i] += z2[i]; for (int i = 0; i < nb; ++i) b[i] += z2[na + i];
     }
+#endif
     static inline float res(float m) { const float t = Gtcrn::ftanh(m); return 1.f + (t < 0 ? t : 0.1f * t); }
     void step(const float* se, const float* sy, float* out) {
 #ifdef GTCRN_PROF

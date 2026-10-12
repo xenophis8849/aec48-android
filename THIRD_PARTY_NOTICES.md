@@ -47,6 +47,17 @@ SOFTWARE.
 
 ```
 
+## KleidiAI
+
+`third_party/kleidiai/`（节选，未修改，见其 `README.md`），静态链接进 `libaec48.so`。来源：<https://gitlab.arm.com/kleidi/kleidiai>（v1.32.0）。许可：Apache License 2.0，全文见 `third_party/kleidiai/LICENSES/Apache-2.0.txt`。
+
+**分发包含 `libaec48.so` 的软件（例如 App）时，须附上 Apache License 2.0 全文及以下版权声明**（Apache-2.0 第 4 条）。KleidiAI 未附 NOTICE 文件。
+
+```
+SPDX-FileCopyrightText: Copyright 2024-2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+SPDX-License-Identifier: Apache-2.0
+```
+
 ## 测试向量
 
 `test/vec/` 下的录音取自 Microsoft ICASSP 2023 Acoustic Echo Cancellation Challenge 盲测集（远端单讲），来源：<https://github.com/microsoft/AEC-Challenge>。按 Microsoft 提供该数据集时的条款使用（"as is"，见上述仓库 README 的 Dataset licenses 一节），仅用于本库自检，不随库分发。`*_expected*.pcm` 为本库处理上述录音的输出。

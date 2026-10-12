@@ -11,13 +11,14 @@
 | 路径 | 内容 |
 |---|---|
 | `include/aec48.h` | 全部接口（C） |
-| `prebuilt/arm64-v8a/libaec48.so`、`prebuilt/armeabi-v7a/libaec48.so` | 预编译库（NDK r28，minSdk 26，c++_static） |
+| `prebuilt/arm64-v8a/libaec48.so`、`prebuilt/armeabi-v7a/libaec48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
 | `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、上传工具测试、测试向量 |
 | `tools/build_android.sh`、`tools/embed_models.py` | 编译脚本、模型内嵌脚本 |
 | `third_party/pffft/` | FFT 库（BSD 类许可，见其 `LICENSE.txt`） |
+| `third_party/kleidiai/` | Arm KleidiAI 节选：int8 量化打包与点积矩阵乘内核（Apache-2.0） |
 | `LICENSE`、`THIRD_PARTY_NOTICES.md` | 本库许可与第三方声明 |
 
 ---
@@ -207,32 +208,33 @@ javac -d /tmp/aec48up android/src/com/karaoke/aec48/Aec48Uploader.java test/Aec4
 
 ### 测法
 
-`test/aec48_bench`：按真实节奏每 8 ms 送一块（48 kHz、384 样本），用 `taskset` 把进程钉在指定核心上跑 30 s，统计处理线程的 CPU 时间 / 墙钟时间（= 该核心被占用的比例），以及每块处理耗时与超时（单块超过 8 ms）次数。另以全速（不睡眠）跑 10 s 量实时率。按真实节奏时核心会降频，所以占用率比全速实时率高，前者才反映实际运行时的占用。
+`test/aec48_bench`：按真实节奏每 8 ms 送一块（48 kHz、384 样本），用 `taskset` 把进程钉在指定核心上跑 30 s，统计处理线程的 CPU 时间 / 墙钟时间（= 该核心被占用的比例），以及每块处理耗时与超时（单块超过 8 ms）次数。另以全速（不睡眠）跑 10 s 量实时率。按真实节奏时核心会降频，所以占用率比全速实时率高，前者才反映实际运行时的占用。Galaxy S10 息屏进入打盹状态时，系统不允许把进程钉到中 / 大核（`taskset` 报 Invalid argument），测这几档时须点亮屏幕。
 
 ```sh
 adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> ./aec48_bench 03ra86gHhkWD_mic.pcm 03ra86gHhkWD_ref.pcm 48000 30 1'
 ```
 
-### 结果（0.3，48 kHz，每块 8 ms，回声消除开）
+### 结果（0.4，48 kHz，每块 8 ms，回声消除开）
 
 | 设备（SoC） | 核心 | ABI | 核心占用 | 每块耗时 平均 / p99 / 最大（ms） | 超时块 | 全速实时率 |
 |---|---|---|---|---|---|---|
-| Galaxy S10 SM-G9730（骁龙 855） | 中核 Kryo 485 Gold 2.42 GHz（A76 级） | arm64-v8a | 14.7% | 1.17 / 1.52 / 1.9 | 0 | 0.034 |
-| | | armeabi-v7a | 19.2% | 1.53 / 1.96 / 2.2 | 0 | 0.048 |
-| | 小核 Kryo 485 Silver 1.79 GHz（A55 级） | arm64-v8a | 46.8% | 3.89 / 6.28 / 17.2 | 16 / 3750 | 0.178 |
-| | | armeabi-v7a | 62.7% | 5.16 / 7.12 / 19.0 | 26 / 3750 | 0.257 |
-| | 不绑核（系统调度） | arm64-v8a | 46.3% | 3.82 / 6.16 / 16.3 | 14 / 3750 | 0.029 |
-| | | armeabi-v7a | 62.1% | 5.11 / 7.49 / 15.6 | 30 / 3750 | 0.041 |
-| vivo V1934A（Helio P65） | 大核 Cortex-A75 2.0 GHz | arm64-v8a | 19.5% | 1.51 / 1.59 / 1.8 | 0 | 0.099 |
-| | | armeabi-v7a | 23.7% | 1.82 / 1.95 / 2.9 | 0 | 0.115 |
-| | 小核 Cortex-A55 1.7 GHz | arm64-v8a | 50.6% | 3.97 / 4.62 / 5.5 | 0 | 0.273 |
-| | | armeabi-v7a | 64.7% | 5.12 / 5.57 / 6.3 | 0 | 0.354 |
+| Galaxy S10 SM-G9730（骁龙 855） | 中核 Kryo 485 Gold 2.42 GHz（A76 级） | arm64-v8a | 13.1% | 1.01 / 1.42 / 1.8 | 0 | 0.031 |
+| | | armeabi-v7a | 19.0% | 1.51 / 1.85 / 2.9 | 0 | 0.049 |
+| | 小核 Kryo 485 Silver 1.79 GHz（A55 级） | arm64-v8a | 41.7% | 3.42 / 4.23 / 10.8 | 2 / 3750 | 0.151 |
+| | | armeabi-v7a | 62.7% | 5.10 / 5.89 / 10.0 | 6 / 3750 | 0.233 |
+| | 不绑核（系统调度） | arm64-v8a | 42.2% | 3.40 / 4.05 / 12.9 | 3 / 3750 | 0.027 |
+| | | armeabi-v7a | 61.7% | 5.00 / 5.87 / 9.0 | 9 / 3750 | 0.041 |
+| vivo V1934A（Helio P65） | 大核 Cortex-A75 2.0 GHz | arm64-v8a | 19.5% | 1.51 / 1.75 / 5.5 | 0 | 0.100 |
+| | | armeabi-v7a | 24.0% | 1.88 / 2.51 / 5.3 | 0 | 0.106 |
+| | 小核 Cortex-A55 1.7 GHz | arm64-v8a | 49.5% | 3.89 / 5.01 / 5.6 | 0 | 0.235 |
+| | | armeabi-v7a | 63.7% | 5.03 / 5.65 / 7.6 | 0 | 0.338 |
 
-- 内存：每个实例常驻约 5.3–5.7 MB；开录音（`aec48_dump_start`）后另加约 6 MB 录音缓冲（第一次录音时分配）。内嵌模型在库文件里：arm64 1.9 MB、armv7 1.7 MB。
-- S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.029，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
-- 小核上平均耗时约 3.9 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核约 0.4%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
+- 内存：每个实例常驻约 5.3–6.0 MB；开录音（`aec48_dump_start`）后另加约 6 MB 录音缓冲（第一次录音时分配）。内嵌模型在库文件里：arm64 1.9 MB、armv7 1.7 MB。
+- S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.027，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
+- 小核上平均耗时约 3.4–3.9 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核约 0.1%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
 - 64 位比 32 位省 15–25%，优先用 arm64-v8a。
 - 边录音边处理（`AEC48_DUMP_DIR` 设给 `aec48_bench`，写盘线程与处理绑在同一个小核上，按真实节奏 300 s）：S10 超时块 0.46% → 0.57%、平均耗时 3.95 → 4.13 ms；vivo 超时块 9 → 3 次（无差别）；两台都没有丢弃，三个文件等长。
+- 与 0.3 相比（同设备同测法，arm64）：小核占用 S10 46.8% → 41.7%、vivo 50.6% → 49.5%；中 / 大核 14.7% → 13.1%、19.5% → 19.5%。全速每块耗时 S10 小核 1.41 → 1.21 ms、vivo 小核 2.22 → 1.88 ms。
 - 与 0.2 相比（同设备同测法）：小核占用 S10 53.9% → 46.8%、vivo 56.5% → 50.6%；中 / 大核占用 15.4% → 14.7%、23.0% → 19.5%（arm64）。
 
 ---
@@ -275,14 +277,18 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 | 时延估计 | 多时延相干度与能量包络结合的在线估计，范围 0 – 约 1 s，带切换确认 |
 | 线性级 | 每频点 8 抽头的对角卡尔曼滤波；噪声参数由小网络（32 个频带、GRU）逐帧估计；同时并行一套经典卡尔曼，逐频点取误差小者；参考信号因果电平归一 |
 | 残余回声抑制 | CoFi-Lite（约 30.5 万参数）：输入线性级输出谱与线性回声估计谱，ERB 粗路 + 低频细路，输出逐频点增益（下限 −20 dB），相位不变 |
-| 端上推理 | 手写 C++（无推理框架依赖），单帧、每帧零分配；FFT 用 pffft（NEON） |
+| 端上推理 | 手写 C++（无推理框架依赖），单帧、每帧零分配；FFT 用 pffft（NEON）；掩码网络中间的两个全连接层用 int8（Arm KleidiAI 的量化方式与点积内核，CPU 不支持点积指令时走算法相同的后备路径） |
 | 训练 | PyTorch；回声模拟数据管线 |
 
 ---
 
 ## 版本与模型
 
-- 当前：`aec48 0.3 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：`aec48 0.4 (lin nlinBc3-dual, mask v59ae20)`。
+- 0.4 修改：
+  - 掩码网络中间两个全连接层改用 int8：Arm KleidiAI 的量化方式（输入每帧动态非对称量化、权重按行对称量化）。CPU 支持点积指令时用 KleidiAI 的点积内核，不支持时（Cortex-A53 等、armv7、x86）走算法相同的后备路径，各设备结果一致。点积指令按系统声明判断，系统不声明时按 `/proc/cpuinfo` 里的核心型号判断（部分旧内核不声明，但 Cortex-A55/A75 等本身支持）。效果在 AEC Challenge 盲测集与近端说话 / 唱歌测试集上与 0.3 无差别（漏消、误消、近端误压、齿音、AECMOS 各项都在测试波动内）；三个测试向量与期望输出的差值能量为 −47～−53 dB（浮点舍入量级之外的部分来自量化）。小核每块耗时约降 10–15%，见上面的性能表。
+  - 最低系统版本从 Android 8.0（API 26）降到 Android 5.0（API 21）：内嵌模型的内存读取改用各版本都有的 `funopen`（0.3 的 `fmemopen` 要 API 23，且 API 26 构建引用了 Android 7.0 才有的 `__write_chk`，在 Android 6.0 上加载失败）。已在 Android 6.0 真机上通过自检与健壮性测试。
+  - `aec48_bench` 可边录音边测（`AEC48_DUMP_DIR`）。
 - 0.3 修改（模型不变；三个测试向量结果与 0.2 相同，差值能量在浮点舍入范围内）：
   - 提速：掩码网络的逐点卷积改为 4 输出通道 × 4 频点一组在寄存器里累加，深度卷积先补零再算（去掉逐点边界判断）。小核每块耗时约降 10–20%，见上面的性能表。
   - `aec48_process_s16` 不再按 4096 样本内部分段：0.2 在声明块长为 384 的整数倍且单次超过 4096 样本时（如 4608、12288）会插入零样本、打乱时间对齐。现在与 float 版走同一处理循环，输出逐样本一致。
@@ -309,9 +315,9 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 许可
 
-本库源码、模型权重与预编译库不开源，见 [`LICENSE`](LICENSE)。第三方部分（pffft、测试向量）按各自条款，见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+本库源码、模型权重与预编译库不开源，见 [`LICENSE`](LICENSE)。第三方部分（pffft、KleidiAI、测试向量）按各自条款，见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
-**集成方注意：** `libaec48.so` 静态链接了 pffft，分发带这个库的 App 时，要在 App 的开源许可 / 第三方声明页面里附上 `THIRD_PARTY_NOTICES.md` 中 pffft 那一段。
+**集成方注意：** `libaec48.so` 静态链接了 pffft 和 KleidiAI，分发带这个库的 App 时，要在 App 的开源许可 / 第三方声明页面里附上 `THIRD_PARTY_NOTICES.md` 中 pffft 那一段，以及 KleidiAI 的版权声明和 Apache License 2.0 全文。
 
 ---
 
