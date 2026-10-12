@@ -15,7 +15,7 @@
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
-| `test/aec48_check.cpp`、`test/vec/` | 自检程序与测试向量 |
+| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/vec/` | 自检程序、端上测速程序、测试向量 |
 | `tools/build_android.sh`、`tools/embed_models.py` | 编译脚本、模型内嵌脚本 |
 | `third_party/pffft/` | FFT 库（BSD 类许可，见其 `LICENSE.txt`） |
 
@@ -187,12 +187,33 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 
 ## 性能
 
-| 设备 | ABI | 实时率（单核，越小越省） | 每 8 ms 块耗时 |
-|---|---|---|---|
-| Galaxy S10（Exynos 9820） | arm64-v8a | 0.032 | 平均 ≈ 0.26 ms |
-| Galaxy S10（Exynos 9820） | armeabi-v7a | 0.049 | 平均 0.37 ms，最大 3.7 ms |
+### 测法
 
-库体积：arm64 1.9 MB、armv7 1.7 MB（含模型）。
+`test/aec48_bench`：按真实节奏每 8 ms 送一块（48 kHz、384 样本），用 `taskset` 把进程钉在指定核心上跑 30 s，统计处理线程的 CPU 时间 / 墙钟时间（= 该核心被占用的比例），以及每块处理耗时与超时（单块超过 8 ms）次数。另以全速（不睡眠）跑 10 s 量实时率。按真实节奏时核心会降频，所以占用率比全速实时率高，前者才反映实际运行时的占用。
+
+```sh
+adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> ./aec48_bench 03ra86gHhkWD_mic.pcm 03ra86gHhkWD_ref.pcm 48000 30 1'
+```
+
+### 结果（48 kHz，每块 8 ms，回声消除开）
+
+| 设备（SoC） | 核心 | ABI | 核心占用 | 每块耗时 平均 / p99 / 最大（ms） | 超时块 | 全速实时率 |
+|---|---|---|---|---|---|---|
+| Galaxy S10 SM-G9730（骁龙 855） | 中核 Kryo 485 Gold 2.42 GHz（A76 级） | arm64-v8a | 15.4% | 1.20 / 1.74 / 10.6 | 1 / 3750 | 0.037 |
+| | | armeabi-v7a | 21.5% | 1.70 / 2.12 / 3.16 | 0 | 0.055 |
+| | 小核 Kryo 485 Silver 1.79 GHz（A55 级） | arm64-v8a | 53.9% | 4.45 / 6.57 / 17.1 | 18 / 3750 | 0.211 |
+| | | armeabi-v7a | 68.4% | 5.63 / 7.38 / 15.1 | 17 / 3750 | 0.311 |
+| | 不绑核（系统调度） | arm64-v8a | 54.2% | 4.46 / 6.79 / 15.6 | 23 / 3750 | 0.032 |
+| | | armeabi-v7a | 69.5% | 5.70 / 7.38 / 13.5 | 16 / 3750 | 0.047 |
+| vivo V1934A（Helio P65） | 大核 Cortex-A75 2.0 GHz | arm64-v8a | 23.0% | 1.79 / 1.97 / 2.91 | 0 | 0.110 |
+| | | armeabi-v7a | 25.4% | 1.98 / 2.07 / 2.33 | 0 | 0.123 |
+| | 小核 Cortex-A55 1.7 GHz | arm64-v8a | 56.5% | 4.46 / 4.96 / 5.62 | 0 | 0.315 |
+| | | armeabi-v7a | 71.3% | 5.65 / 6.11 / 7.03 | 0 | 0.407 |
+
+- 内存：每个实例常驻约 5.3–5.7 MB；开录音（`aec48_dump_start`）后另加约 6 MB 录音缓冲（第一次录音时分配）。内嵌模型在库文件里：arm64 1.9 MB、armv7 1.7 MB。
+- S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.032，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
+- 小核上平均耗时约 4.5 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核 0.5%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
+- 64 位比 32 位省 10–25%，优先用 arm64-v8a。
 
 ---
 

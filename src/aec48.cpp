@@ -68,7 +68,6 @@ Aec48* aec48_create(int sample_rate, int frames_per_call) {
     a->prefill = (frames_per_call > 0 && frames_per_call % a->H == 0) ? 0 : a->H;
     std::vector<float> z(a->prefill, 0.f); if (a->prefill) a->outQ.push(z.data(), z.size());
     a->lat = a->chain.latency() + a->prefill; a->lastStat = std::chrono::steady_clock::now();
-    for (auto& q : a->dq) q.init(1 << 19);
     a->fm.assign(8192, 0.f); a->fr.assign(8192, 0.f); a->fo.assign(8192, 0.f);
     return a;
 }
@@ -105,6 +104,7 @@ int aec48_process_s16(Aec48* a, const short* mic, const short* ref, short* out, 
 int aec48_dump_start(Aec48* a, const char* dir) {
     if (!a || !dir) return -1; std::lock_guard<std::mutex> lk(a->dmu); if (a->dumping.load()) return 0;
     a->ddir = dir; static const char* nm[3] = {"mic", "ref", "out"};
+    for (auto& q : a->dq) if (q.b.empty()) q.init(1 << 19);   // 录音缓冲在第一次录音时才分配（约 6 MB），不录音不占；process 只在 dumping 置位后才写它
     for (int k = 0; k < 3; ++k) { a->dq[k].r.store(a->dq[k].w.load()); if (!a->wav[k].open(a->ddir + "/" + nm[k] + ".wav", a->sr)) { for (int j = 0; j < k; ++j) a->wav[j].close(); return -2; } }
     { std::lock_guard<std::mutex> e(a->emu); a->events.clear(); }
     a->dumpStart = a->samples.load(); a->dumpWall = std::chrono::system_clock::now(); a->dumpDrop = 0; a->enabledAtStart = a->enabled.load(); a->dumping = true;
