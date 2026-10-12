@@ -15,7 +15,7 @@
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
-| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、上传工具测试、测试向量 |
+| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/aec48_oom.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、内存分配失败注入（Linux 主机）、上传工具测试、测试向量 |
 | `tools/build_android.sh`、`tools/embed_models.py` | 编译脚本、模型内嵌脚本 |
 | `third_party/pffft/` | FFT 库（BSD 类许可，见其 `LICENSE.txt`） |
 | `third_party/kleidiai/` | Arm KleidiAI 节选：int8 量化打包与点积矩阵乘内核（Apache-2.0） |
@@ -192,6 +192,7 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 
 ```sh
 ./build-host/aec48_robust test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm /tmp/aec48_robust_dir
+./build-host/aec48_oom      # 建实例时每一次 malloc 逐次失败：都返回 NULL、不崩溃（Linux 主机）
 ```
 
 也可以用 ThreadSanitizer 构建跑这个测试查线程竞态（`-DCMAKE_CXX_FLAGS=-fsanitize=thread` 等，0.3 无告警）。
@@ -284,7 +285,8 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`aec48 0.4.2 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：`aec48 0.4.3 (lin nlinBc3-dual, mask v59ae20)`。
+- 0.4.3 修改：pffft 在建 FFT 时没有检查内存分配失败，内存不足时 `aec48_create` 会使宿主进程崩溃（应返回 NULL）。已补上检查（对 pffft 的修改见 THIRD_PARTY_NOTICES）。新增 `test/aec48_oom`（Linux 主机）：让建实例过程中的每一次 `malloc` 逐次失败，确认都返回 NULL、不崩溃。`aec48_robust` 替换的是 `operator new`，拦不到 C 代码里的 `malloc`，所以之前没测出来。处理结果与 0.4.2 相同。
 - 0.4.2 修改：编译时把源码目录映射成 `.`（`-ffile-prefix-map`），预编译库里不再带构建机的绝对路径（0.4.1 及更早的库里，pffft 的断言写进了源文件的绝对路径）；线性级 sigmoid 的参数限到 ±80，避免个别编译器 / 数学库组合下 `expf` 溢出取到错值（正常输入不触及，输出不变）。
 - 0.4.1 修改：点积指令只按系统声明（`HWCAP_ASIMDDP`）判断。0.4 在系统不声明时还会按 `/proc/cpuinfo` 的核心型号推断，但 Cortex-A55 / A75 的点积指令是可选配置，型号对得上也可能没有，误用会触发非法指令并结束宿主进程；现在系统不声明的设备一律走后备路径（输出相同，掩码网络全连接层稍慢，见性能表 vivo 一行）。
 - 0.4 修改：

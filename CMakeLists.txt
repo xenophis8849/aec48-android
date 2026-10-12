@@ -45,5 +45,16 @@ if(AEC48_BUILD_CHECK OR NOT ANDROID)
   target_link_libraries(aec48_robust PRIVATE aec48)
   if(NOT ANDROID)
     target_link_libraries(aec48_robust PRIVATE pthread)
+    # 内存分配失败注入：借 glibc 的 __libc_malloc 转发，只在能链接到它的 Linux 主机上编（macOS、musl 跳过）
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      include(CheckCSourceCompiles)
+      check_c_source_compiles("#include <stddef.h>
+extern void* __libc_malloc(size_t);
+int main(void) { return __libc_malloc(1) == 0; }" AEC48_HAVE_LIBC_MALLOC)
+      if(AEC48_HAVE_LIBC_MALLOC)
+        add_executable(aec48_oom test/aec48_oom.cpp)
+        target_link_libraries(aec48_oom PRIVATE aec48)
+      endif()
+    endif()
   endif()
 endif()
