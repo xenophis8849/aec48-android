@@ -4,8 +4,8 @@
 // 两条计算路径结果一致（整数部分精确，收尾同一式子）：
 //   · arm64 且 CPU 支持点积指令：KleidiAI 内核 matmul_clamp_f32_qai8dxp1x8_qsi8cxp4x8_1x4_neon_dotprod；
 //   · 其他（ARMv8.0 如 Cortex-A53、armv7、x86）：同一个输入量化打包函数 + 整数点积（NEON smull+sadalp / 标量）。
-// 点积指令的判断：系统声明（HWCAP_ASIMDDP），或 /proc/cpuinfo 里所有核心都是已知支持点积指令的型号（部分旧内核不声明这一位，
-//   但 Cortex-A55/A75 等核心本身支持）。环境变量 Q8_NODOT=1 强制走后备路径（测试用）。
+// 点积指令只认系统声明（HWCAP_ASIMDDP）。不能按核心型号推断：Cortex-A55 / A75 的点积指令是可选配置（Arm 官方说明），
+//   型号对得上也可能没有，误用会触发非法指令、结束宿主进程。系统不声明时（含部分旧内核）走后备路径，结果相同、稍慢。
 // KleidiAI 的源文件不加 -ffast-math 编译（量化的取整与比例须各平台一致）。
 #pragma once
 #include <cstdint>
@@ -33,33 +33,13 @@ inline int pad16(int c) { return (c + 15) & ~15; }
 inline size_t kRound(size_t k) { return (k + 31) / 32 * 32; }   // = KleidiAI kai_k_roundedup
 
 #if defined(__aarch64__)
-// /proc/cpuinfo 里所有核心都在这张表里才算有点积指令（ARMv8.2 dotprod）。implementer << 12 | part
-inline bool partHasDot(unsigned imp, unsigned part) {
-    static const unsigned arm[] = {0xd05, 0xd0a, 0xd0b, 0xd0c, 0xd0d, 0xd0e, 0xd40, 0xd41, 0xd42, 0xd44, 0xd46, 0xd47, 0xd48, 0xd49, 0xd4b, 0xd4c, 0xd4d, 0xd4e,
-                                   0xd80, 0xd81, 0xd82, 0xd85, 0xd87, 0xd8e};   // A55 A75 A76 N1 A77 A76AE V1 A78 A78AE X1 A510 A710 X2 N2 A78C X1C A715 X3 A520 A720 X4 X925 A725 N3
-    static const unsigned qcom[] = {0x802, 0x803, 0x804, 0x805};                 // Kryo 3xx/4xx Gold/Silver（A75/A55/A76/A55 派生）
-    if (imp == 0x41) { for (unsigned p : arm) if (p == part) return true; }
-    if (imp == 0x51) { for (unsigned p : qcom) if (p == part) return true; }
-    return false;
-}
-inline bool cpuinfoHasDot() {
-    FILE* f = fopen("/proc/cpuinfo", "r"); if (!f) return false;
-    char l[256]; unsigned imp = 0; int nPart = 0; bool all = true;
-    while (fgets(l, sizeof l, f)) {
-        unsigned v;
-        if (sscanf(l, "CPU implementer : %x", &v) == 1) imp = v;
-        else if (sscanf(l, "CPU part : %x", &v) == 1) { ++nPart; if (!partHasDot(imp, v)) all = false; }
-    }
-    fclose(f); return nPart > 0 && all;
-}
 inline int kernelChoice() {   // 0 = 后备路径；8 = KleidiAI 1x8 内核
     static const int v = [] {
         if (getenv("Q8_NODOT")) return 0;
         bool dot = false;
 #if defined(__linux__)
-        dot = (getauxval(AT_HWCAP) & (1UL << 20)) != 0;   // HWCAP_ASIMDDP
+        dot = (getauxval(AT_HWCAP) & (1UL << 20)) != 0;   // HWCAP_ASIMDDP：只认系统声明
 #endif
-        if (!dot) dot = cpuinfoHasDot();
         return dot ? 8 : 0;
     }();
     return v;
