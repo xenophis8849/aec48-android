@@ -85,6 +85,15 @@ int main(int argc, char** argv) {
     { Aec48* a = aec48_create(48000, 384); std::vector<float> o(384); aec48_process(a, &mic[0], &ref[0], o.data(), 384);
       g_news = 0; g_count = true; for (long i = 384; i + 384 <= std::min<long>(n, 384 * 2000); i += 384) aec48_process(a, &mic[i], &ref[i], o.data(), 384); g_count = false;
       check(g_news.load() == 0, "M-01 连续 2000 次 process 期间 operator new 次数为 0", std::to_string(g_news.load())); aec48_destroy(a); }
+    // M-06（0.5，Codex 对抗审查）：录音中在处理线程里拨两个开关（回声消除 / 频谱回调），开关本身与随后的处理都不分配内存
+    { Aec48* a = aec48_create(48000, 384); std::vector<float> o(384);
+      aec48_set_spec_hook(a, [](void*, float*, float*, int) {}, nullptr);
+      std::string d = tmp + "/m06"; mkdir(d.c_str(), 0755); aec48_dump_start(a, d.c_str());
+      for (int i = 0; i < 50; ++i) aec48_process(a, &mic[(size_t)i * 384], &ref[(size_t)i * 384], o.data(), 384);
+      g_news = 0; g_count = true;
+      for (int i = 50; i < 450; ++i) { if (i % 7 == 0) aec48_set_enabled(a, (i / 7) & 1); if (i % 11 == 0) aec48_set_spec_hook_enabled(a, (i / 11) & 1); aec48_process(a, &mic[(size_t)i * 384], &ref[(size_t)i * 384], o.data(), 384); }
+      g_count = false; aec48_dump_stop(a); aec48_destroy(a);
+      check(g_news.load() == 0, "M-06 录音中拨开关 + 处理 400 块：operator new 次数为 0", std::to_string(g_news.load())); }
 
     // M-02：int16 长度不受限（8192 / 8193 / 20000），与 float 分块一致
     { long M = std::min<long>(n, 20000); std::vector<short> ms(M), rs(M), os(M);

@@ -91,7 +91,8 @@ aec48_destroy(aec);
 ### 线程
 
 - 一个实例的 `process` 只在同一个线程里调用。`process` 内不分配内存、不加锁、不读写文件，可以直接在音频回调里调。
-- `aec48_set_enabled`、`aec48_set_spec_hook_enabled`、`aec48_dump_start/stop`、`aec48_stats` 可以在任意线程调。
+- `aec48_set_enabled`、`aec48_set_spec_hook_enabled` 只写一个原子量（不加锁、不分配内存），可以在任意线程调，包括音频线程。
+- `aec48_dump_start/stop`、`aec48_stats` 可以在任意线程调；`dump_start/stop` 会加锁、分配或等待，不要在音频线程里调。
 - `aec48_set_spec_hook` 不能和 `process` 同时调用（在开始处理前挂好；运行中要临时停用回调，用 `aec48_set_spec_hook_enabled`）。
 - 多路音频各建一个实例，实例之间互不影响。
 
@@ -136,8 +137,8 @@ void my_spec_fn(void* user, float* re, float* im, int bins) { /* 原地修改 re
 
 - 回调在音频线程里执行：不得分配内存、加锁、读写文件或阻塞。回调耗时计入 `aec48_stats` 的每块耗时。
 - 回调需逐帧因果：拿到第 t 帧就给出第 t 帧的结果，不能等后面的帧，否则就不再是「不增加延迟」。
-- 挂着回调时库会多合成一路「回调前」的输出供录音用（见「录音」的 `out_prehook.wav`）：恒等回调实测每块多约 2%（S10 小核 1.242 → 1.269 ms，vivo 小核 2.034 → 2.070 ms，`aec48_hook … bench`）。不挂回调时没有这部分开销。
-- 运行中临时停用：`aec48_set_spec_hook_enabled(a, 0)`，输出与没挂时逐样本相同；重新打开后 3 帧（重叠相加的过渡）内完全切换。
+- 挂着回调时库多维护一路「回调前」的输出（见「录音」的 `out_prehook.wav`）：回调开着时多一次逆变换，关着时只多一次重叠相加。不挂回调时没有这份开销（摘掉后再维护 4 块，保证马上重新挂上时状态也是对的）。开销实测见「版本与模型」0.5.1。
+- 运行中临时停用：`aec48_set_spec_hook_enabled(a, 0)`（可在音频线程调），输出与没挂时逐样本相同；重新打开后 3 帧（重叠相加的过渡）内完全切换。
 
 ---
 
@@ -159,7 +160,7 @@ aec48_dump_stop(aec);
 | `ref.wav` | 参考输入 |
 | `out.wav` | 输出（比 mic 晚 `latency_samples` 个样本） |
 | `out_prehook.wav` | 仅在**录音开始时挂着频谱回调**才有：回调之前的输出（与 `out.wav` 同一时间轴），用来分清问题出在回声消除还是串接的处理 |
-| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间 `aec48_set_enabled` 的切换：`{"pos": 样本位置, "enabled": 0/1}`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`）、`spec_hook`（`attached_at_start`：录音开始时是否挂着回调；挂着时另有 `enabled_at_start` 与 `samples_out_prehook`；录音期间 `aec48_set_spec_hook_enabled` 的切换记在 `events`，形如 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`） |
+| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间两个开关的切换：`{"pos": 样本位置, "enabled": 0/1}` 或 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`。由处理线程在切换生效的那一块记录，`pos` = 那一块在录音时间轴（`mic.wav` 样本序号）上的末尾；在 `out.wav` 上要再晚 `latency_samples`，回调开关另有约 3 块的重叠相加过渡。最多记 1024 条，更多的计入 `events_overflow`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`）、`spec_hook`（`attached_at_start`：录音开始时是否挂着回调；挂着时另有 `enabled_at_start` 与 `samples_out_prehook`；录音期间 `aec48_set_spec_hook_enabled` 的切换记在 `events`，形如 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`） |
 
 各路（三路；挂着回调时四路）按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的各路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数；紧挨着的几次丢弃合并成一段），所以三个文件始终等长、互相对齐。`dropped` 最多记 1024 段；更多时 `dropped_overflow` 给出 `{"from_pos": 第一个没记下的位置, "calls": 之后的丢弃次数, "samples": 之后丢的样本数}`——`from_pos` 之前的时间轴可以按 `dropped` 完整还原，之后只知道合计。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，已落盘的部分保留，wav 头与 `meta.json` 里的样本数和文件实际内容一致。建议每次录音使用一个新目录。
 
@@ -329,7 +330,13 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`aec48 0.5 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：`aec48 0.5.1 (lin nlinBc3-dual, mask v59ae20)`。
+- 0.5.1 修改（按 0.5 的独立审查）：
+  - `aec48_set_enabled` / `aec48_set_spec_hook_enabled` 改为只写原子量。0.5 及更早在录音中调用会加锁并分配内存（`aec48_set_enabled` 从 0.1 起如此），在音频线程里调用有卡顿风险。录音事件改由处理线程在块边界记进预分配的表，`pos` 精确到生效的那一块（以前是调用开关时那次 `process` 的末尾），新增 `events_overflow`。
+  - 「回调前」那路只在挂着回调时维护（0.5 不挂时也有一次拷贝），摘掉后再维护 4 块：0.5 在摘掉后马上重新挂上时，从回调后的状态拷贝，`out_prehook.wav` 开头 3 块会偏。
+  - 同一目录先挂回调录、再不挂回调录时，`aec48_dump_start` 删掉上次的 `out_prehook.wav`；`Aec48Uploader` 只在本次 `meta.json` 记了挂着回调时才传它。
+  - 开销（小核 cpu0 全速，每块平均）：不挂回调时与 0.4.3 交替各 4 轮，S10 1.240 / 1.242 ms、vivo 1.979 / 1.975 ms，分不出差别；挂恒等回调比不挂多 0.03–0.07 ms（S10 +2.5%、vivo +3.5%，`aec48_hook … bench` 单次读数，有 ±1–2% 抖动）。
+  - 测试：`aec48_hook` 加 H-8（多块一次的调用里切换，事件落在生效块）、H-9（同目录重录）、H-10 / H-11（摘掉后马上 / 隔 10 块再挂上）；`aec48_robust` 加 M-06（录音中拨开关 + 处理，`operator new` 次数为 0）；上传工具测试加遗留文件一项。不挂回调时输出仍与 0.4.3 逐字节相同。
 - 0.5 修改（模型不变）：新增频谱回调 `aec48_set_spec_hook` / `aec48_set_spec_hook_enabled` / `aec48_spec_format`，见「串接其他处理」；挂着回调时录音另写 `out_prehook.wav`，`meta.json` 加 `spec_hook`；`Aec48Uploader` 有该文件时一并上传。不挂回调时处理结果与 0.4.3 逐字节相同（三个测试向量 × 块长 384 / 480 / 1024，主机）。新增 `test/aec48_hook`（主机、S10、vivo 的 arm64 与 S10 的 armv7 全部通过）。
 - 0.4.3 修改：pffft 在建 FFT 时没有检查内存分配失败，内存不足时 `aec48_create` 会使宿主进程崩溃（应返回 NULL）。已补上检查（对 pffft 的修改见 THIRD_PARTY_NOTICES）。新增 `test/aec48_oom`（Linux 主机）：让建实例过程中的每一次 `malloc` 逐次失败，确认都返回 NULL、不崩溃。`aec48_robust` 替换的是 `operator new`，拦不到 C 代码里的 `malloc`，所以之前没测出来。处理结果与 0.4.2 相同。
 - 0.4.2 修改：编译时把源码目录映射成 `.`（`-ffile-prefix-map`），预编译库里不再带构建机的绝对路径（0.4.1 及更早的库里，pffft 的断言写进了源文件的绝对路径）；线性级 sigmoid 的参数限到 ±80，避免个别编译器 / 数学库组合下 `expf` 溢出取到错值（正常输入不触及，输出不变）。

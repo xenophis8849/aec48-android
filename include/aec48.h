@@ -1,5 +1,5 @@
 /*
- * aec48 0.5 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.5.1 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -7,7 +7,7 @@
  *   aec48_destroy(a);
  *
  * 线程：一个实例的 process 只能在同一个线程里调（不加锁、不分配内存、不做文件读写，可以放在音频回调里）；
- *       aec48_set_enabled / aec48_dump_* 可以在任意线程调。
+ *       aec48_set_enabled / aec48_set_spec_hook_enabled 只写一个原子量（不加锁、不分配），可以在任意线程调，包括音频线程；aec48_dump_* 可以在任意线程调（会加锁，不要在音频线程里调）。
  * 数据：float，满幅 ±1.0，单声道。mic 与 ref 必须是同一个采样率、同样多的样本。
  * 延迟：out 比 mic 晚 aec48_latency_samples() 个样本（48k、块长为 384 的整数倍时 1152 = 24 ms；其他块长 1536 = 32 ms）。
  */
@@ -38,7 +38,7 @@ AEC48_EXPORT int aec48_process(Aec48* a, const float* mic, const float* ref, flo
 /* int16 版，同上（与 float 版同一处理循环，长度不受限、可同址，输出与 float 版逐样本一致）。返回值同 aec48_process。 */
 AEC48_EXPORT int aec48_process_s16(Aec48* a, const short* mic, const short* ref, short* out, int n);
 
-/* 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变，便于 A/B 对比）。下一块生效。
+/* 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变，便于 A/B 对比）。下一块生效。只写原子量，可在音频线程调。
  * 关闭期间线性级与掩码照常运行、只是不用其输出，所以切回开时立即是正常状态，无需重新收敛；代价是关闭时算力不省。 */
 AEC48_EXPORT void aec48_set_enabled(Aec48* a, int on);
 
@@ -46,7 +46,7 @@ AEC48_EXPORT void aec48_set_enabled(Aec48* a, int on);
 AEC48_EXPORT int aec48_latency_samples(const Aec48* a);
 
 /* 录音：把 mic / ref / out 三路分别写成 16 bit wav 到目录 dir（mic.wav / ref.wav / out.wav，已有的覆盖），停止时写 meta.json。
- * 写文件在库内部的后台线程，不阻塞 process。三路按"一次 process 调用"整包写入：后台写不及时时，该次调用的三路一起丢弃，
+ * 写文件在库内部的后台线程，不阻塞 process。meta.json 的 events 记录音期间两个开关的切换：pos = 切换生效的那一块在录音时间轴（mic.wav 样本序号）上的末尾。三路按"一次 process 调用"整包写入：后台写不及时时，该次调用的三路一起丢弃，
  * 丢弃位置记在 meta.json 的 dropped 里（相邻的合并成一段），三个文件始终等长、互相对齐（out 比 mic 晚 latency_samples）。
  * 返回 0 成功；-1 参数无效；-2 文件打不开；-3 内存或线程创建失败（录音用到的内存都在这里分配，失败不会影响宿主进程）。
  * aec48_dump_stop 结束并补好 wav 头（可在任意线程调，会等进行中的 process 写完）。 */
@@ -80,7 +80,8 @@ typedef void (*aec48_spec_hook)(void* user, float* re, float* im, int bins);
  * 挂着回调时开始录音（aec48_dump_start），会另写 out_prehook.wav = 回调之前的输出（与 out.wav 同一时间轴），便于分清问题出在哪一级；meta.json 的 spec_hook 记录挂接与开关状态。 */
 AEC48_EXPORT int aec48_set_spec_hook(Aec48* a, aec48_spec_hook fn, void* user);
 
-/* 回调开关：1 = 调用（默认），0 = 跳过（输出与没挂回调时逐样本相同）。可在任意线程调用，下一帧生效；录音中切换会记进 meta.json 的 events。 */
+/* 回调开关：1 = 调用（默认），0 = 跳过（输出与没挂回调时逐样本相同）。只写原子量，可在任意线程（含音频线程）调用，下一块生效；
+ * 录音中的切换由处理线程在生效的那一块记进 meta.json 的 events。 */
 AEC48_EXPORT void aec48_set_spec_hook_enabled(Aec48* a, int on);
 
 /* 查询帧格式：采样率、窗长、帧移、窗型编号。串接方据此核对自己的格式，对不上就不要挂。 */

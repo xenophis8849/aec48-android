@@ -53,6 +53,7 @@ public final class Aec48Uploader {
         int failed = 0;
         for (String[] t : files) {
             File f = new File(dir, t[1]), mark = new File(dir, t[1] + ".uploaded");
+            if (t.length > 2 && !prehookInMeta(dir)) continue;   // 可选音轨只在本次 meta.json 记了「录音开始时挂着回调」才传，目录里遗留的旧文件不传
             if (!f.isFile()) { if (t.length > 2) continue; failed++; if (cb != null) cb.onFile(t[0], false, "缺文件 " + t[1]); continue; }
             String stamp;
             try { stamp = sessionId + "|" + f.length() + "|" + crc32(f); }
@@ -66,6 +67,10 @@ public final class Aec48Uploader {
             } catch (Exception e) { failed++; if (cb != null) cb.onFile(t[0], false, e.toString()); }
         }
         return failed;
+    }
+
+    private static boolean prehookInMeta(File dir) {
+        try { return readText(new File(dir, "meta.json")).replace(" ", "").contains("\"spec_hook\":{\"attached_at_start\":1"); } catch (Exception e) { return false; }
     }
 
     private int post(File f, String track, String sessionId) throws Exception {

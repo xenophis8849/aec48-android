@@ -8,6 +8,10 @@
 //  H-5 开关：回调挂着但关掉 → 与不挂逐样本相同；中途打开 → 打开后的输出与「一直开着」相同（从打开那一帧之后、扣掉重叠相加的 3 块过渡）。
 //  H-6 挂接约束：录音中挂 / 摘返回 -3；参数无效返回 -1。
 //  H-7 录音：挂着 ×0.5 回调录音 → out.wav ≈ 不挂时 × 0.5、out_prehook.wav = 不挂时（int16 差 ≤ 1 LSB），meta.json 有 spec_hook。
+//  H-8 开关事件定位：每次 process 送 10 块；在回调里于第 g 帧关掉回声消除、第 f 帧关掉回调（g < f：回调关掉后就不再被调用） → meta 事件 pos 都 = 生效那一块的末尾（(f+3)·384、(g+3)·384）。
+//  H-9 同一目录：先挂回调录、再摘掉回调录 → 第二次后目录里不再有 out_prehook.wav。
+//  H-11 摘掉、不挂处理 10 块、再挂上后录音：同上。
+//  H-10 摘掉再挂上（中间不处理）后录音：out_prehook.wav 仍 = 回调前（Codex 审查 0.5：回调前那路的重叠相加状态不能从回调后的状态拷）。
 #include "aec48.h"
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +31,10 @@ static void hookFn(void* u, float* re, float* im, int bins) {
 }
 // 直通时核对帧格式：保存每帧频谱，事后用朴素 DFT 比
 struct Cap { std::vector<std::vector<float>> re, im; long maxFrames = 6; };
+struct Tog { Aec48* a = nullptr; long frame = 0, offHookAt = -1, offAecAt = -1; };
+static void togFn(void* u, float*, float*, int) { Tog* t = (Tog*)u; if (t->frame == t->offHookAt) aec48_set_spec_hook_enabled(t->a, 0); if (t->frame == t->offAecAt) aec48_set_enabled(t->a, 0); ++t->frame; }
+static std::string slurp(const std::string& p) { std::string m; FILE* f = fopen(p.c_str(), "rb"); if (f) { char b[4096]; size_t g; while ((g = fread(b, 1, sizeof b, f))) m.append(b, g); fclose(f); } return m; }
+static bool exists(const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if (f) fclose(f); return f != nullptr; }
 static void capFn(void* u, float* re, float* im, int bins) { Cap* c = (Cap*)u; if ((long)c->re.size() < c->maxFrames) { c->re.emplace_back(re, re + bins); c->im.emplace_back(im, im + bins); } }
 
 static std::vector<float> run(int sr, const std::vector<float>& mic, const std::vector<float>& ref, aec48_spec_hook fn, void* u, int enabled = 1, long hookOnAt = -1) {
@@ -102,6 +110,42 @@ int main(int argc, char** argv) {
         ck(m == n && ep <= 1, "H-7 录音 out_prehook.wav = 回调前", "(最大差 %.0f LSB)", ep);
         FILE* f = fopen((d + "/meta.json").c_str(), "rb"); std::string meta; if (f) { char b[4096]; size_t g; while ((g = fread(b, 1, sizeof b, f))) meta.append(b, g); fclose(f); }
         ck(meta.find("\"spec_hook\":{\"attached_at_start\":1") != std::string::npos, "H-7 meta.json 记了 spec_hook", "%.0f", 0);
+
+        {   // H-8：回调在第 f 帧关回调、第 g 帧关回声消除（都是下一块生效）；每次 process 送 10 块，事件仍要落在块上
+            const long f = 37, g = 29; Aec48* b = aec48_create(sr, 3840); Tog t; t.a = b; t.offHookAt = f; t.offAecAt = g;
+            aec48_set_spec_hook(b, togFn, &t); aec48_dump_start(b, d.c_str());
+            std::vector<float> o2(n, 0.f); for (long i = 0; i + 3840 <= n; i += 3840) aec48_process(b, &mic[i], &ref[i], &o2[i], 3840);
+            aec48_dump_stop(b); aec48_destroy(b); std::string m = slurp(d + "/meta.json");
+            char e1[96], e2[96]; snprintf(e1, sizeof e1, "{\"pos\":%ld,\"spec_hook_enabled\":0}", (f + 3) * 384); snprintf(e2, sizeof e2, "{\"pos\":%ld,\"enabled\":0}", (g + 3) * 384);
+            ck(m.find(e1) != std::string::npos && m.find(e2) != std::string::npos && m.find("\"events_overflow\":0") != std::string::npos, "H-8 开关事件落在生效那一块的末尾", "(回调开关 pos %.0f)", (double)(f + 3) * 384);
+            if (m.find(e1) == std::string::npos) printf("    meta：%s\n", m.c_str()); }
+        {   // H-9：同一目录先挂回调录（上面 H-8 刚录过，有 out_prehook.wav），再不挂回调录
+            bool had = exists(d + "/out_prehook.wav"); Aec48* b = aec48_create(sr, 384); aec48_dump_start(b, d.c_str());
+            std::vector<float> o2(n, 0.f); for (long i = 0; i + 384 <= n; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
+            aec48_dump_stop(b); aec48_destroy(b);
+            ck(had && !exists(d + "/out_prehook.wav"), "H-9 不挂回调再录：旧 out_prehook.wav 已删", "%.0f", 0); }
+        {   // H-10：先挂置零回调处理一半 → 摘掉 → 马上挂回 ×1 回调 → 录后一半：out_prehook 应 = 一直不挂时的输出
+            Aec48* b = aec48_create(sr, 384); Rec z; z.zero = true; Rec one; aec48_set_spec_hook(b, hookFn, &z);
+            const long half = (blocks / 2) * 384; std::vector<float> o2(n, 0.f);
+            for (long i = 0; i < half; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
+            aec48_set_spec_hook(b, nullptr, nullptr); aec48_set_spec_hook(b, hookFn, &one); aec48_dump_start(b, d.c_str());
+            for (long i = half; i + 384 <= n; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
+            aec48_dump_stop(b); aec48_destroy(b);
+            auto pw = rd((d + "/out_prehook.wav").c_str()); int e = 0;
+            for (long i = 0; i + 22 < (long)pw.size() && half + i < n; ++i) e = std::max(e, std::abs(pw[i + 22] - q(base[half + i])));
+            ck((long)pw.size() - 22 == n - half && e <= 1, "H-10 摘掉再挂上后录音：out_prehook = 回调前", "(最大差 %.0f LSB)", e); }
+        {   // H-11：置零回调处理一段 → 摘掉 → 不挂处理 10 块（> 4 块，走「两路本来相等、直接拷」那条路）→ 挂回 ×1 回调 → 录：out_prehook = 回调前
+            Aec48* b = aec48_create(sr, 384); Rec z; z.zero = true; Rec one; aec48_set_spec_hook(b, hookFn, &z);
+            const long q1 = (blocks / 4) * 384, q2 = q1 + 10 * 384; std::vector<float> o2(n, 0.f);
+            for (long i = 0; i < q1; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
+            aec48_set_spec_hook(b, nullptr, nullptr);
+            for (long i = q1; i < q2; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
+            aec48_set_spec_hook(b, hookFn, &one); aec48_dump_start(b, d.c_str());
+            for (long i = q2; i + 384 <= n; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
+            aec48_dump_stop(b); aec48_destroy(b);
+            auto pw = rd((d + "/out_prehook.wav").c_str()); int e = 0;
+            for (long i = 0; i + 22 < (long)pw.size() && q2 + i < n; ++i) e = std::max(e, std::abs(pw[i + 22] - q(base[q2 + i])));
+            ck((long)pw.size() - 22 == n - q2 && e <= 1, "H-11 摘掉 10 块后再挂上：out_prehook = 回调前", "(最大差 %.0f LSB)", e); }
     }
     if (fails) printf("共 %d 项不通过\n", fails); else printf("全部通过\n");
     return fails ? 1 : 0;

@@ -42,9 +42,13 @@ public class Aec48UploaderTest {
             check(r == 0 && posts.get() == 4, "接收端恢复后同会话补传：4 个都传", "返回 " + r + "，请求 " + posts.get());
             new File(dir, "meta.json").delete(); posts.set(0); r = up.upload(dir, "s4", null);
             check(r == 1 && posts.get() == 3, "缺 meta.json：计 1 个失败，其余照传", "返回 " + r + "，请求 " + posts.get());
-            put(new File(dir, "meta.json"), "content-meta".getBytes("UTF-8")); put(new File(dir, "out_prehook.wav"), "content-pre".getBytes("UTF-8"));
+            put(new File(dir, "out_prehook.wav"), "content-pre".getBytes("UTF-8"));
+            put(new File(dir, "meta.json"), "{\"spec_hook\":{\"attached_at_start\":0},\"events\":[]}".getBytes("UTF-8"));
             posts.set(0); r = up.upload(dir, "s5", null);
-            check(r == 0 && posts.get() == 5, "有 out_prehook.wav（挂着频谱回调录的）：5 个都传", "返回 " + r + "，请求 " + posts.get());
+            check(r == 0 && posts.get() == 4, "本次 meta 记没挂回调、目录里有旧 out_prehook.wav：不传它", "返回 " + r + "，请求 " + posts.get());
+            put(new File(dir, "meta.json"), "{\"spec_hook\":{\"attached_at_start\":1,\"enabled_at_start\":1},\"events\":[]}".getBytes("UTF-8"));
+            posts.set(0); r = up.upload(dir, "s6", null);
+            check(r == 0 && posts.get() == 5, "本次 meta 记挂着回调：out_prehook.wav 一并传，共 5 个", "返回 " + r + "，请求 " + posts.get());
         } finally {
             srv.stop(0); for (File f : dir.listFiles()) f.delete(); dir.delete();
         }
