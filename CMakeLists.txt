@@ -43,6 +43,8 @@ if(AEC48_BUILD_CHECK OR NOT ANDROID)
   target_link_libraries(aec48_bench PRIVATE aec48)
   add_executable(aec48_robust test/aec48_robust.cpp)
   target_link_libraries(aec48_robust PRIVATE aec48)
+  add_executable(aec48_hook test/aec48_hook.cpp)
+  target_link_libraries(aec48_hook PRIVATE aec48)
   if(NOT ANDROID)
     target_link_libraries(aec48_robust PRIVATE pthread)
     # 内存分配失败注入：借 glibc 的 __libc_malloc 转发，只在能链接到它的 Linux 主机上编（macOS、musl 跳过）

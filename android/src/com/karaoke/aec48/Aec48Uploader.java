@@ -13,7 +13,8 @@ import java.util.UUID;
 import java.util.zip.CRC32;
 
 /**
- * 录音上传（aec48_dump_stop 之后调用）：把录音目录里的 mic.wav / ref.wav / out.wav / meta.json 逐个上传。
+ * 录音上传（aec48_dump_stop 之后调用）：把录音目录里的 mic.wav / ref.wav / out.wav / meta.json 逐个上传；
+ * 有 out_prehook.wav（录音时挂着频谱回调，0.5 起）也一并上传，没有不算失败。
  *
  * 两项配置由接入方填：
  *   uploadUrl —— 接收地址（HTTP/HTTPS），例如 https://内部域名/aec/upload
@@ -48,11 +49,11 @@ public final class Aec48Uploader {
             if (sessionId == null) sessionId = sidFile.exists() ? readText(sidFile).trim() : UUID.randomUUID().toString();
             writeText(sidFile, sessionId);
         } catch (Exception e) { if (cb != null) cb.onFile("-", false, "写 session_id 失败：" + e); return 4; }
-        String[][] files = {{"mic", "mic.wav"}, {"ref", "ref.wav"}, {"out", "out.wav"}, {"meta", "meta.json"}};
+        String[][] files = {{"mic", "mic.wav"}, {"ref", "ref.wav"}, {"out", "out.wav"}, {"meta", "meta.json"}, {"out_prehook", "out_prehook.wav", "optional"}};
         int failed = 0;
         for (String[] t : files) {
             File f = new File(dir, t[1]), mark = new File(dir, t[1] + ".uploaded");
-            if (!f.isFile()) { failed++; if (cb != null) cb.onFile(t[0], false, "缺文件 " + t[1]); continue; }
+            if (!f.isFile()) { if (t.length > 2) continue; failed++; if (cb != null) cb.onFile(t[0], false, "缺文件 " + t[1]); continue; }
             String stamp;
             try { stamp = sessionId + "|" + f.length() + "|" + crc32(f); }
             catch (Exception e) { failed++; if (cb != null) cb.onFile(t[0], false, "读文件失败：" + e); continue; }

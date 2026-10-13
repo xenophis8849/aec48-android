@@ -4,6 +4,8 @@
 //   int16 与 float 走同一个循环（0.3：不再按 4096 内部分段——分段会在声明块长为 384 倍数时插零，见审查复查 R-01）。
 // 录音：mic / ref / out 三路按"一次 process 调用"整包写入（三路要么都收、要么都丢，丢的位置记进 meta.json）；写盘在后台线程，
 //   直接用文件描述符写，只计真正落盘的字节（写盘出错时 WAV 头、meta 与文件实际内容一致，R-03）。
+// 频谱回调（0.5，给串联降噪等后处理用）：每帧输出频谱在合成前交给接入方的回调原地改，库本身不依赖任何后处理库。
+//   挂着回调时，处理链同时合成一路「回调前」的输出进 outP（与 outQ 同步进出）；录音开始时挂着回调，就多写 out_prehook.wav。
 #include "aec48.h"
 #include "aec_chain.h"
 #include <atomic>
@@ -65,22 +67,26 @@ const float kZero[384] = {0};
 
 struct Aec48 {
     ac::Chain chain; int sr = 48000, H = 384, prefill = 0, lat = 0;
-    std::vector<float> inM, inR, blkO; int fill = 0; Ring outQ;
+    std::vector<float> inM, inR, blkO, blkP; int fill = 0; Ring outQ, outP;   // outP：回调前的输出，与 outQ 同步推、同步取
     std::atomic<int> enabled{1};
-    std::vector<float> tmpO;         // 取输出的中转（H 个，create 时分配）
+    std::vector<float> tmpO, tmpP;   // 取输出的中转（H 个，create 时分配）
+    ac::SpecHook hook = nullptr; void* hookUser = nullptr; std::atomic<int> hookOn{1}; std::atomic<int> inProc{0};
     // 统计
     std::atomic<double> avgMs{0}, maxMs{0}; std::atomic<long> samples{0}, outPadded{0}; double accMs = 0, accMax = 0; long accN = 0; std::chrono::steady_clock::time_point lastStat;
     // 录音（dump）
     std::mutex dmu; std::atomic<bool> dumping{false}, stopReq{false}; std::atomic<int> busy{0}; std::thread dth; std::condition_variable dcv; std::mutex dcvm;
-    Ring dq[3]; Wav wav[3]; std::string ddir; std::atomic<long> dumpPos{0}, dumpDrop{0}; size_t dqCap = 1 << 19; std::vector<float> dbuf; std::atomic<bool> thErr{false};
+    Ring dq[4]; Wav wav[4]; int nTr = 3; bool hookAtStart = false; int hookOnAtStart = 1;   // 第 4 路 = out_prehook（录音开始时挂着回调才写）
+    std::string ddir; std::atomic<long> dumpPos{0}, dumpDrop{0}; size_t dqCap = 1 << 19; std::vector<float> dbuf; std::atomic<bool> thErr{false};
     Drop drops[kMaxDrops]; int nDrops = 0; long dropSamples = 0, ovFrom = -1, ovCalls = 0, ovSamples = 0;   // 只由 process 线程写；dump_stop 在 busy 归零后读
     std::vector<std::string> events; std::mutex emu; std::chrono::system_clock::time_point dumpWall; int enabledAtStart = 1; std::atomic<bool> lastWriteErr{false};
 };
 
 static void block(Aec48* a, const float* m, const float* r) {
     auto t0 = std::chrono::steady_clock::now();
-    a->chain.push(m, r, a->blkO.data(), a->enabled.load(std::memory_order_relaxed) ? 2 : 0);
+    if (a->hook) a->chain.push(m, r, a->blkO.data(), a->enabled.load(std::memory_order_relaxed) ? 2 : 0, a->hook, a->hookUser, a->hookOn.load(std::memory_order_relaxed) != 0, a->blkP.data());
+    else { a->chain.push(m, r, a->blkO.data(), a->enabled.load(std::memory_order_relaxed) ? 2 : 0); memcpy(a->blkP.data(), a->blkO.data(), a->H * 4); }
     a->outQ.push(a->blkO.data(), a->H);   // outQ 最多积压 prefill + H，远小于容量
+    a->outP.push(a->blkP.data(), a->H);
     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     a->accMs += ms; a->accN++; if (ms > a->accMax) a->accMax = ms;
     if (t0 - a->lastStat > std::chrono::seconds(1)) { a->avgMs = a->accMs / a->accN; a->maxMs = a->accMax; a->accMs = 0; a->accN = 0; a->accMax = 0; a->lastStat = t0; }
@@ -107,7 +113,8 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
     if (a->dumping.load(std::memory_order_acquire)) {
         a->busy.fetch_add(1, std::memory_order_acq_rel);
         if (a->dumping.load(std::memory_order_acquire)) {
-            if (a->dq[0].space() >= (size_t)n && a->dq[1].space() >= (size_t)n && a->dq[2].space() >= (size_t)n) rec = true;
+            bool sp = true; for (int t = 0; t < a->nTr; ++t) sp = sp && a->dq[t].space() >= (size_t)n;
+            if (sp) rec = true;
             else { noteDrop(a, a->dumpPos.load(), n); a->dumpDrop.fetch_add(1); }
             a->dumpPos.fetch_add(n);
         }
@@ -123,11 +130,12 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
         // 取输出：最多取到已读完的输入位置，保证同址时不覆盖还没读的 mic
         for (;;) { const int want = std::min(consumed - produced, H); if (want <= 0) break;
             const int got = (int)a->outQ.pop(a->tmpO.data(), want); if (!got) break;
-            out.put(produced, a->tmpO.data(), got); if (rec) a->dq[2].push(a->tmpO.data(), got); produced += got; }
+            a->outP.pop(a->tmpP.data(), got);   // 与 outQ 同步：两边推的量始终相同
+            out.put(produced, a->tmpO.data(), got); if (rec) { a->dq[2].push(a->tmpO.data(), got); if (a->nTr == 4) a->dq[3].push(a->tmpP.data(), got); } produced += got; }
     }
     if (produced < n) {   // 只在 frames_per_call 声明为 H 的整数倍、实际却传了别的长度时发生：补零、返回 1 并计数
         out.zero(produced, n - produced);
-        if (rec) for (int k = produced; k < n; k += 384) a->dq[2].push(kZero, std::min(384, n - k));
+        if (rec) for (int k = produced; k < n; k += 384) for (int t = 2; t < a->nTr; ++t) a->dq[t].push(kZero, std::min(384, n - k));
         a->outPadded.fetch_add(n - produced);
     }
     if (rec) { a->busy.fetch_sub(1, std::memory_order_acq_rel); a->dcv.notify_one(); }
@@ -136,7 +144,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.4.3 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.5 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -145,12 +153,12 @@ Aec48* aec48_create(int sample_rate, int frames_per_call) {
         std::call_once(g_reg, [] { fb::fb_register_model("lin", aec48_lin_model, aec48_lin_model_size); fb::fb_register_model("mask", aec48_mask_model, aec48_mask_model_size); });
         a = new Aec48(); a->sr = sample_rate;
         if (!a->chain.load("mem:lin", "mem:mask", sample_rate)) { delete a; return nullptr; }
-        a->H = a->chain.H; a->inM.assign(a->H, 0.f); a->inR.assign(a->H, 0.f); a->blkO.assign(a->H, 0.f); a->outQ.init(1 << 13);
+        a->H = a->chain.H; a->inM.assign(a->H, 0.f); a->inR.assign(a->H, 0.f); a->blkO.assign(a->H, 0.f); a->outQ.init(1 << 13); a->outP.init(1 << 13); a->blkP.assign(a->H, 0.f);
         // 块长是 H 的整数倍时输入凑满一块立刻出一块，输出不会欠；否则先垫 H 个零，保证任何块长都不欠（延迟多一块）
         a->prefill = (frames_per_call > 0 && frames_per_call % a->H == 0) ? 0 : a->H;
-        if (a->prefill) a->outQ.push(kZero, a->prefill);
+        if (a->prefill) { a->outQ.push(kZero, a->prefill); a->outP.push(kZero, a->prefill); }
         a->lat = a->chain.latency() + a->prefill; a->lastStat = std::chrono::steady_clock::now();
-        a->tmpO.assign(a->H, 0.f);
+        a->tmpO.assign(a->H, 0.f); a->tmpP.assign(a->H, 0.f);
         return a;
     } catch (...) { delete a; return nullptr; }   // 内存不足 / 模型解析失败：返回 NULL，不退出宿主进程
 }
@@ -164,12 +172,12 @@ void aec48_set_enabled(Aec48* a, int on) {
 
 int aec48_process(Aec48* a, const float* mic, const float* ref, float* out, int n) {
     if (!a || !mic || !ref || !out || n <= 0) return -1;
-    return run(a, InF{mic, ref}, OutF{out}, n);
+    a->inProc.fetch_add(1, std::memory_order_acq_rel); int r = run(a, InF{mic, ref}, OutF{out}, n); a->inProc.fetch_sub(1, std::memory_order_acq_rel); return r;
 }
 
 int aec48_process_s16(Aec48* a, const short* mic, const short* ref, short* out, int n) {
     if (!a || !mic || !ref || !out || n <= 0) return -1;
-    return run(a, InS{mic, ref}, OutS{out}, n);
+    a->inProc.fetch_add(1, std::memory_order_acq_rel); int r = run(a, InS{mic, ref}, OutS{out}, n); a->inProc.fetch_sub(1, std::memory_order_acq_rel); return r;
 }
 
 int aec48_dump_start(Aec48* a, const char* dir) {
@@ -180,8 +188,9 @@ int aec48_dump_start(Aec48* a, const char* dir) {
         for (auto& q : a->dq) q.r.store(q.w.load());
         if (a->dbuf.empty()) a->dbuf.assign(1 << 15, 0.f);
         for (auto& w : a->wav) if (w.buf.empty()) w.buf.assign(1 << 15, 0);
-        a->ddir = dir; static const char* nm[3] = {"mic", "ref", "out"};
-        for (int k = 0; k < 3; ++k) if (!a->wav[k].open(a->ddir + "/" + nm[k] + ".wav", a->sr)) { for (int j = 0; j < k; ++j) a->wav[j].close(); return -2; }
+        a->hookAtStart = a->hook != nullptr; a->hookOnAtStart = a->hookOn.load(); a->nTr = a->hookAtStart ? 4 : 3;
+        a->ddir = dir; static const char* nm[4] = {"mic", "ref", "out", "out_prehook"};
+        for (int k = 0; k < a->nTr; ++k) if (!a->wav[k].open(a->ddir + "/" + nm[k] + ".wav", a->sr)) { for (int j = 0; j < k; ++j) a->wav[j].close(); return -2; }
         { std::lock_guard<std::mutex> e(a->emu); a->events.clear(); }
         a->dumpWall = std::chrono::system_clock::now(); a->dumpPos = 0; a->dumpDrop = 0; a->nDrops = 0; a->dropSamples = 0; a->ovFrom = -1; a->ovCalls = 0; a->ovSamples = 0; a->thErr = false; a->enabledAtStart = a->enabled.load(); a->stopReq = false; a->lastWriteErr = false;
         a->dth = std::thread([a] {
@@ -189,7 +198,7 @@ int aec48_dump_start(Aec48* a, const char* dir) {
                 float* b = a->dbuf.data(); const size_t bs = a->dbuf.size();
                 for (;;) {
                     const bool stop = a->stopReq.load(std::memory_order_acquire); size_t any = 0;
-                    for (int k = 0; k < 3; ++k) { size_t g = a->dq[k].pop(b, bs); if (g) { a->wav[k].write(b, g); any += g; } }
+                    for (int k = 0; k < a->nTr; ++k) { size_t g = a->dq[k].pop(b, bs); if (g) { a->wav[k].write(b, g); any += g; } }
                     if (stop && !any) break;   // stopReq 只在没有进行中的写入后置位，此时三路剩余量相同，排空即对齐
                     if (!any) { std::unique_lock<std::mutex> l(a->dcvm); a->dcv.wait_for(l, std::chrono::milliseconds(50)); }
                 }
@@ -204,12 +213,16 @@ void aec48_dump_stop(Aec48* a) {
     a->dumping.store(false, std::memory_order_release);
     while (a->busy.load(std::memory_order_acquire) > 0) std::this_thread::yield();   // 等进行中的那次 process 把三路写完
     a->stopReq.store(true, std::memory_order_release); a->dcv.notify_one(); if (a->dth.joinable()) a->dth.join();
-    bool werr = a->thErr.load(); for (auto& w : a->wav) { w.close(); werr = werr || w.err; }
+    bool werr = a->thErr.load(); for (int k = 0; k < a->nTr; ++k) { a->wav[k].close(); werr = werr || a->wav[k].err; }
     // 说明文件：分析时对齐用（out 比 mic 晚 latency_samples；enabled 开关切换的位置；整包丢弃的位置）
     FILE* f = fopen((a->ddir + "/meta.json").c_str(), "wb");
     if (f) { long long t = std::chrono::duration_cast<std::chrono::milliseconds>(a->dumpWall.time_since_epoch()).count();
-        fprintf(f, "{\"version\":\"%s\",\"sample_rate\":%d,\"latency_samples\":%d,\"samples\":%ld,\"samples_mic_ref_out\":[%ld,%ld,%ld],\"start_unix_ms\":%lld,\"write_error\":%d,\"enabled_at_start\":%d,\"events\":[",
+        fprintf(f, "{\"version\":\"%s\",\"sample_rate\":%d,\"latency_samples\":%d,\"samples\":%ld,\"samples_mic_ref_out\":[%ld,%ld,%ld],\"start_unix_ms\":%lld,\"write_error\":%d,\"enabled_at_start\":%d,",
                 aec48_version(), a->sr, a->lat, a->wav[0].n, a->wav[0].n, a->wav[1].n, a->wav[2].n, t, werr ? 1 : 0, a->enabledAtStart);
+        // 频谱回调：录音开始时挂没挂、开没开；挂着时 out_prehook.wav = 回调前的输出（与 out 同一时间轴）
+        if (a->hookAtStart) fprintf(f, "\"spec_hook\":{\"attached_at_start\":1,\"enabled_at_start\":%d,\"samples_out_prehook\":%ld},", a->hookOnAtStart, a->wav[3].n);
+        else fprintf(f, "\"spec_hook\":{\"attached_at_start\":0},");
+        fprintf(f, "\"events\":[");
         { std::lock_guard<std::mutex> e(a->emu); for (size_t i = 0; i < a->events.size(); ++i) fprintf(f, "%s%s", i ? "," : "", a->events[i].c_str()); }
         // 整包丢弃（写盘跟不上）：pos = 录音时间轴上的样本位置，n = 丢的样本数（三路同时丢，文件里直接缺这一段；相邻丢包已合并成一段）。
         // 段数超过 1024 时 dropped_overflow 给出第一个没记下的位置与之后的合计：from_pos 之前的时间轴可完整恢复，之后不能逐段恢复
@@ -225,6 +238,26 @@ void aec48_dump_stop(Aec48* a) {
 int aec48_dump_status(const Aec48* a) { return !a ? -1 : (a->lastWriteErr.load() ? -4 : 0); }
 
 void aec48_stats(const Aec48* a, double o[4]) { if (!a || !o) return; o[0] = a->avgMs; o[1] = a->maxMs; o[2] = (double)a->samples.load(); o[3] = (double)a->dumpDrop.load(); }
+
+int aec48_set_spec_hook(Aec48* a, aec48_spec_hook fn, void* user) {
+    if (!a) return -1;
+    if (a->inProc.load(std::memory_order_acquire) > 0) return -2;   // 正在 process：拒绝（尽力检测，约定上调用方保证不并发）
+    std::lock_guard<std::mutex> lk(a->dmu); if (a->dumping.load()) return -3;   // 录音中不换挂钩：out_prehook 的有无在录音开始时定
+    if (fn && !a->hook) a->chain.accP = a->chain.acc;   // 新挂上：回调前那路的重叠相加状态从当前输出接上，第一块就是完整的
+    a->hook = fn; a->hookUser = fn ? user : nullptr; return 0;
+}
+
+void aec48_set_spec_hook_enabled(Aec48* a, int on) {
+    if (!a) return; a->hookOn = on ? 1 : 0;
+    if (a->dumping.load()) { std::lock_guard<std::mutex> lk(a->emu); char b[96]; snprintf(b, sizeof b, "{\"pos\":%ld,\"spec_hook_enabled\":%d}", a->dumpPos.load(), on ? 1 : 0); a->events.push_back(b); }
+}
+
+void aec48_spec_format(const Aec48* a, int* sample_rate, int* nfft, int* hop, int* window_id) {
+    if (sample_rate) *sample_rate = a ? a->sr : 0;
+    if (nfft) *nfft = a ? a->chain.N : 0;
+    if (hop) *hop = a ? a->chain.H : 0;
+    if (window_id) *window_id = a ? AEC48_WINDOW_SQRT_HANN_PERIODIC : 0;
+}
 
 void aec48_destroy(Aec48* a) { if (!a) return; aec48_dump_stop(a); delete a; }
 

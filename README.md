@@ -15,7 +15,7 @@
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
-| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/aec48_oom.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、内存分配失败注入（Linux 主机）、上传工具测试、测试向量 |
+| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/aec48_oom.cpp`、`test/aec48_hook.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、内存分配失败注入（Linux 主机）、频谱回调测试、上传工具测试、测试向量 |
 | `tools/build_android.sh`、`tools/embed_models.py` | 编译脚本、模型内嵌脚本 |
 | `third_party/pffft/` | FFT 库（BSD 类许可，见其 `LICENSE.txt`） |
 | `third_party/kleidiai/` | Arm KleidiAI 节选：int8 量化打包与点积矩阵乘内核（Apache-2.0） |
@@ -73,6 +73,9 @@ aec48_destroy(aec);
 | `int aec48_dump_start(Aec48*, const char* dir)` / `void aec48_dump_stop(Aec48*)` | 录音：把 mic / ref / out 写成 `dir` 下的 `mic.wav`、`ref.wav`、`out.wav`（16 bit 单声道），停止时另写 `meta.json`。start 返回 0 成功、−1 参数无效、−2 文件打不开、−3 内存或线程创建失败。见「录音与上传」。 |
 | `int aec48_dump_status(const Aec48*)` | 上一次录音的写盘结果（stop 之后查）：0 正常，−4 有写盘错误。 |
 | `void aec48_stats(const Aec48*, double out4[4])` | 最近一秒：[0] 每块平均处理耗时 ms，[1] 最大 ms，[2] 已处理样本数，[3] 录音丢块数。 |
+| `int aec48_set_spec_hook(Aec48*, aec48_spec_hook fn, void* user)` | 挂上（`fn` 非空）或摘掉（`fn` = NULL）频谱回调，见「串接其他处理」。只能在没有 `process` 进行中、也没在录音时调用。返回 0 成功、−1 参数无效、−2 检测到 `process` 正在进行、−3 正在录音。 |
+| `void aec48_set_spec_hook_enabled(Aec48*, int on)` | 回调开关：1 = 调用（默认），0 = 跳过（输出与没挂时逐样本相同）。任意线程，下一帧生效。 |
+| `void aec48_spec_format(const Aec48*, int* sample_rate, int* nfft, int* hop, int* window_id)` | 查询回调里频谱的帧格式。 |
 | `void aec48_destroy(Aec48*)` | 释放（录音中会先停止录音）。 |
 | `const char* aec48_version(void)` | 版本与模型标识。 |
 
@@ -88,7 +91,8 @@ aec48_destroy(aec);
 ### 线程
 
 - 一个实例的 `process` 只在同一个线程里调用。`process` 内不分配内存、不加锁、不读写文件，可以直接在音频回调里调。
-- `aec48_set_enabled`、`aec48_dump_start/stop`、`aec48_stats` 可以在任意线程调。
+- `aec48_set_enabled`、`aec48_set_spec_hook_enabled`、`aec48_dump_start/stop`、`aec48_stats` 可以在任意线程调。
+- `aec48_set_spec_hook` 不能和 `process` 同时调用（在开始处理前挂好；运行中要临时停用回调，用 `aec48_set_spec_hook_enabled`）。
 - 多路音频各建一个实例，实例之间互不影响。
 
 ---
@@ -98,9 +102,42 @@ aec48_destroy(aec);
 1. **麦克风要用原始采集。** 不要用带系统回声消除的采集方式（AAudio / OpenSL 的 `VOICE_COMMUNICATION` 预设、`AudioManager.MODE_IN_COMMUNICATION` 等），否则两层处理叠加。推荐输入预设 `GENERIC` 或 `UNPROCESSED`。
 2. **参考信号 `ref` = 扬声器实际播放的最终声音**，也就是所有要播出去的声音（远端人声、背景音乐、提示音……）混完之后、送进播放设备的那一路。没进参考的声音消不掉。
 3. **两路不用调用方对齐。** `mic` 与 `ref` 之间的时间差由库在线估计（0 – 约 1 s），只要求：同一台设备、同一采样率、每次样本数相同、按时间顺序连续送入。最简单的做法是在播放回调里同时读麦克风、记下本次播放的样本（见 `example/duplex_example.cpp`）。
-4. **调用位置：** 采集之后、后续处理之前（降噪、自动增益、编码、混音等都放在 `out` 之后）。
+4. **调用位置：** 采集之后、后续处理之前（降噪、自动增益、编码、混音等都放在 `out` 之后）。工作在同一帧格式上的频域处理（如降噪）也可以用频谱回调串在库内部，不额外增加延迟，见「串接其他处理」。
 5. **起步：** 有回声后约 0.5 s 内收敛。回声路径变化（换位置、换路由等）时库在线重新适应，不需要重建实例；切换扬声器 / 听筒 / 耳机等路由的场景尚未专门测试。
 6. **单声道。** 立体声采集取一路或先下混。
+
+---
+
+## 串接其他处理（频谱回调）
+
+本库内部按 STFT 逐帧处理。0.5 起可以挂一个回调：每帧输出频谱在合成回波形之前交给回调，回调原地修改。用途是把另一个工作在同一帧格式上的频域处理（例如降噪）直接接在回声消除后面，省掉一次「合成 → 再分析」，**不增加延迟**（整体仍是 `aec48_latency_samples`），也省一次正反变换。本库不依赖、也不链接任何后处理库；双方只靠下面的帧格式约定对接。
+
+```c
+int sr, nfft, hop, win;
+aec48_spec_format(aec, &sr, &nfft, &hop, &win);      // 串接方据此核对自己的格式，对不上就不要挂
+aec48_set_spec_hook(aec, my_spec_fn, my_state);       // 开始处理前挂好
+...
+void my_spec_fn(void* user, float* re, float* im, int bins) { /* 原地修改 re[0..bins)、im[0..bins) */ }
+```
+
+帧格式：
+
+| 项 | 值 |
+|---|---|
+| 窗长 `nfft` / 帧移 `hop` | 1536 / 384 样本（48 kHz 与 44.1 kHz 都按样本数计；48 kHz 下每 8 ms 一帧） |
+| 频点数 `bins` | `nfft/2 + 1` = 769（0 = 直流，768 = 奈奎斯特） |
+| 窗（`window_id` = `AEC48_WINDOW_SQRT_HANN_PERIODIC` = 1） | 周期 sqrt-Hann：`w[i] = sqrt(0.5·(1 − cos(2π·i/nfft)))`；分析与合成同一个窗 |
+| 频谱 | 加窗帧的不归一化 DFT，负指数：`X[k] = Σ w[n]·x[n]·e^{−j2πkn/nfft}`，波形满幅 ±1.0。等价于 `torch.stft(x, n_fft=1536, hop_length=384, window=torch.hann_window(1536, periodic=True).sqrt(), center=False, return_complex=True)` |
+| 合成 | `IDFT / nfft`，乘窗重叠相加，再除以窗平方的重叠和；回调返回后直流与奈奎斯特的虚部被置 0 |
+| 内容 | 回声消除开：消除后的输出（近端人声 + 背景噪声；本库不降噪）。`aec48_set_enabled(a, 0)` 直通：麦克风原始频谱。两种情况回调都会被调用 |
+| 时机 | 每帧一次，在 `aec48_process` 的调用线程里同步执行；开始处理的前两块凑不满第一帧，不调用 |
+
+要求与注意：
+
+- 回调在音频线程里执行：不得分配内存、加锁、读写文件或阻塞。回调耗时计入 `aec48_stats` 的每块耗时。
+- 回调需逐帧因果：拿到第 t 帧就给出第 t 帧的结果，不能等后面的帧，否则就不再是「不增加延迟」。
+- 挂着回调时库会多合成一路「回调前」的输出供录音用（见「录音」的 `out_prehook.wav`）：恒等回调实测每块多约 2%（S10 小核 1.242 → 1.269 ms，vivo 小核 2.034 → 2.070 ms，`aec48_hook … bench`）。不挂回调时没有这部分开销。
+- 运行中临时停用：`aec48_set_spec_hook_enabled(a, 0)`，输出与没挂时逐样本相同；重新打开后 3 帧（重叠相加的过渡）内完全切换。
 
 ---
 
@@ -121,13 +158,14 @@ aec48_dump_stop(aec);
 | `mic.wav` | 麦克风输入 |
 | `ref.wav` | 参考输入 |
 | `out.wav` | 输出（比 mic 晚 `latency_samples` 个样本） |
-| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间 `aec48_set_enabled` 的切换：`{"pos": 样本位置, "enabled": 0/1}`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`） |
+| `out_prehook.wav` | 仅在**录音开始时挂着频谱回调**才有：回调之前的输出（与 `out.wav` 同一时间轴），用来分清问题出在回声消除还是串接的处理 |
+| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间 `aec48_set_enabled` 的切换：`{"pos": 样本位置, "enabled": 0/1}`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`）、`spec_hook`（`attached_at_start`：录音开始时是否挂着回调；挂着时另有 `enabled_at_start` 与 `samples_out_prehook`；录音期间 `aec48_set_spec_hook_enabled` 的切换记在 `events`，形如 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`） |
 
-三路按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的三路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数；紧挨着的几次丢弃合并成一段），所以三个文件始终等长、互相对齐。`dropped` 最多记 1024 段；更多时 `dropped_overflow` 给出 `{"from_pos": 第一个没记下的位置, "calls": 之后的丢弃次数, "samples": 之后丢的样本数}`——`from_pos` 之前的时间轴可以按 `dropped` 完整还原，之后只知道合计。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，已落盘的部分保留，wav 头与 `meta.json` 里的样本数和文件实际内容一致。建议每次录音使用一个新目录。
+各路（三路；挂着回调时四路）按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的各路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数；紧挨着的几次丢弃合并成一段），所以三个文件始终等长、互相对齐。`dropped` 最多记 1024 段；更多时 `dropped_overflow` 给出 `{"from_pos": 第一个没记下的位置, "calls": 之后的丢弃次数, "samples": 之后丢的样本数}`——`from_pos` 之前的时间轴可以按 `dropped` 完整还原，之后只知道合计。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，已落盘的部分保留，wav 头与 `meta.json` 里的样本数和文件实际内容一致。建议每次录音使用一个新目录。
 
 ### 上传（可配置）
 
-`Aec48Uploader` 把一个录音目录里的 4 个文件逐个上传。需要配置两项：
+`Aec48Uploader` 把一个录音目录里的 4 个文件逐个上传；有 `out_prehook.wav` 时一并上传（track 名 `out_prehook`），没有不算失败。需要配置两项：
 
 | 配置 | 含义 |
 |---|---|
@@ -195,7 +233,13 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 ./build-host/aec48_oom      # 建实例时每一次 malloc 逐次失败：都返回 NULL、不崩溃（Linux 主机）
 ```
 
-也可以用 ThreadSanitizer 构建跑这个测试查线程竞态（`-DCMAKE_CXX_FLAGS=-fsanitize=thread` 等，0.3 无告警）。
+也可以用 ThreadSanitizer 构建跑这个测试查线程竞态（`-DCMAKE_CXX_FLAGS=-fsanitize=thread` 等，0.3、0.5 无告警）。
+
+`test/aec48_hook` 检查频谱回调（主机与手机都能跑，全部通过返回 0）：格式查询；直通时回调拿到的频谱与按上表格式自己算的 DFT 一致（相对误差 ≤ 1e−4）；恒等回调输出与不挂时逐样本相同、每帧恰好调用一次；回调乘 0.5 / 置零时输出相应变化；开关关掉等于没挂、中途打开后与一直开着一致；录音中挂接返回 −3；挂着回调录音时 `out.wav` / `out_prehook.wav` 分别等于回调后 / 回调前的输出。第 4 个参数写 `bench` 时只测挂与不挂的每块耗时。
+
+```sh
+./build-host/aec48_hook test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm 48000 /tmp/aec48_hook_dir   # 目录需已存在
+```
 
 上传工具的测试（主机上有 JDK 即可，会在本机起一个临时 HTTP 服务）：
 
@@ -285,7 +329,8 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`aec48 0.4.3 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：`aec48 0.5 (lin nlinBc3-dual, mask v59ae20)`。
+- 0.5 修改（模型不变）：新增频谱回调 `aec48_set_spec_hook` / `aec48_set_spec_hook_enabled` / `aec48_spec_format`，见「串接其他处理」；挂着回调时录音另写 `out_prehook.wav`，`meta.json` 加 `spec_hook`；`Aec48Uploader` 有该文件时一并上传。不挂回调时处理结果与 0.4.3 逐字节相同（三个测试向量 × 块长 384 / 480 / 1024，主机）。新增 `test/aec48_hook`（主机、S10、vivo 的 arm64 与 S10 的 armv7 全部通过）。
 - 0.4.3 修改：pffft 在建 FFT 时没有检查内存分配失败，内存不足时 `aec48_create` 会使宿主进程崩溃（应返回 NULL）。已补上检查（对 pffft 的修改见 THIRD_PARTY_NOTICES）。新增 `test/aec48_oom`（Linux 主机）：让建实例过程中的每一次 `malloc` 逐次失败，确认都返回 NULL、不崩溃。`aec48_robust` 替换的是 `operator new`，拦不到 C 代码里的 `malloc`，所以之前没测出来。处理结果与 0.4.2 相同。
 - 0.4.2 修改：编译时把源码目录映射成 `.`（`-ffile-prefix-map`），预编译库里不再带构建机的绝对路径（0.4.1 及更早的库里，pffft 的断言写进了源文件的绝对路径）；线性级 sigmoid 的参数限到 ±80，避免个别编译器 / 数学库组合下 `expf` 溢出取到错值（正常输入不触及，输出不变）。
 - 0.4.1 修改：点积指令只按系统声明（`HWCAP_ASIMDDP`）判断。0.4 在系统不声明时还会按 `/proc/cpuinfo` 的核心型号推断，但 Cortex-A55 / A75 的点积指令是可选配置，型号对得上也可能没有，误用会触发非法指令并结束宿主进程；现在系统不声明的设备一律走后备路径（输出相同，掩码网络全连接层稍慢，见性能表 vivo 一行）。

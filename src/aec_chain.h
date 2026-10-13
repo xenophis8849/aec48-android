@@ -1,6 +1,8 @@
 // 处理链的流式包装：线性级（fb/nlin.h）→ 残余回声抑制（fb/cofi.h），两级共用一次 STFT（N=1536 / H=384，sqrt-hann）。
 // 每来 H 个样本推一帧：第 k 块到齐后算第 k−2 帧（窗 = 最近 4 块，开头不足补零），算完后第 k−4 块的输出定稿 → 输出比输入晚 3 块（1152 样本）。
 // mode：0 = 直通（输出麦克风，延迟相同）；1 = 只线性级；2 = 整链。切换不清状态。
+// 频谱回调（0.5）：每帧输出频谱在合成前交给 hook 原地修改（各 mode 都调；开头凑不满第一帧的两块不调）；调完把直流 / 奈奎斯特虚部置 0。
+//   挂了回调时另做一路「回调前」的合成（pre，只在录音时有用）：回调开着才多一次逆变换，关着直接复用同一帧。
 #pragma once
 #include "fb/nlin.h"
 #include "fb/cofi.h"
@@ -26,10 +28,12 @@ struct RFft { int N = 0, M = 0; PFFFT_Setup* s = nullptr; float *in = nullptr, *
         pffft_transform_ordered(s, in, out, wk, PFFFT_BACKWARD); const float sc = 1.f / N; for (int q = 0; q < N; ++q) x[q] = out[q] * sc; }
 };
 
+typedef void (*SpecHook)(void* user, float* re, float* im, int bins);
+
 struct Chain {
     fb::NlinD lin; fb::Cofi cnet; bool hasMask = false;
     int N = 0, H = 0, F = 0; RFft rf;
-    std::vector<float> win, mh, rh, xw, dw, Xr, Xi, Dr, Di, Er, Ei, se, sy, mo, acc, wacc; std::vector<cf> FX;
+    std::vector<float> win, mh, rh, xw, dw, Xr, Xi, Dr, Di, Er, Ei, se, sy, mo, acc, wacc, hr, hi, xp, accP; std::vector<cf> FX;
     double Pg = -1, GA = 0, GT = 0, sr = 48000; long k = 0;
     float lastLin = 0.f, lastMask = 0.f;   // 上一块线性级 / 掩码耗时 ms（统计用）
 
@@ -42,17 +46,19 @@ struct Chain {
         win.resize(N); for (int i = 0; i < N; ++i) win[i] = std::sqrt(0.5f * (1.f - std::cos(2.f * (float)M_PI * i / N)));
         mh.assign(N, 0.f); rh.assign(N, 0.f); xw.resize(N); dw.resize(N); Xr.resize(F); Xi.resize(F); Dr.resize(F); Di.resize(F); Er.resize(F); Ei.resize(F);
         se.resize(2 * F); sy.resize(2 * F); mo.resize(2 * F); FX.resize(N); acc.assign(N, 0.f); wacc.assign(N, 0.f);
+        hr.assign(F, 0.f); hi.assign(F, 0.f); xp.assign(N, 0.f); accP.assign(N, 0.f);
         GA = 1.0 - std::exp(-H / (10.0 * sr)); GT = std::pow(10.0, -25.0 / 20.0);   // 掩码电平归一 τ = 10 s（按实际采样率）
         return true;
     }
     int latency() const { return 3 * H; }
 
-    // mic / ref：本块 H 个样本（±1 满幅）；out：H 个样本（= 4 块之前那块的处理结果）
-    void push(const float* mic, const float* ref, float* out, int mode) {
+    // mic / ref：本块 H 个样本（±1 满幅）；out：H 个样本（= 4 块之前那块的处理结果）。
+    // hook 非空时每帧调一次（hookOn = false 时跳过）；pre 非空时同时写出「回调前」的 H 个样本（与 out 同一时间轴）。
+    void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr) {
         memmove(mh.data(), mh.data() + H, (N - H) * 4); memcpy(mh.data() + N - H, mic, H * 4);
         memmove(rh.data(), rh.data() + H, (N - H) * 4); memcpy(rh.data() + N - H, ref, H * 4);
         ++k;
-        if (k < 2) { memset(out, 0, H * 4); return; }
+        if (k < 2) { memset(out, 0, H * 4); if (pre) memset(pre, 0, H * 4); return; }
         for (int q = 0; q < N; ++q) { xw[q] = rh[q] * win[q]; dw[q] = mh[q] * win[q]; }
         rf.fwd(xw.data(), Xr.data(), Xi.data()); rf.fwd(dw.data(), Dr.data(), Di.data());
         auto c0 = std::chrono::steady_clock::now();
@@ -71,10 +77,21 @@ struct Chain {
         else if (mode == 0) { for (int b = 0; b < F; ++b) FX[b] = cf(Dr[b], Di[b]); }
         lastMask = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - c1).count();
         FX[0] = cf(FX[0].real(), 0); FX[F - 1] = cf(FX[F - 1].real(), 0);
+        const bool callHook = hook && hookOn;
+        if (pre && callHook) { rf.inv(FX.data(), xp.data()); for (int q = 0; q < N; ++q) accP[q] += xp[q] * win[q]; }   // 回调前的这一帧
+        if (callHook) {
+            for (int b = 0; b < F; ++b) { hr[b] = FX[b].real(); hi[b] = FX[b].imag(); }
+            hook(user, hr.data(), hi.data(), F);
+            for (int b = 0; b < F; ++b) FX[b] = cf(hr[b], hi[b]);
+            FX[0] = cf(FX[0].real(), 0); FX[F - 1] = cf(FX[F - 1].real(), 0);
+        }
         rf.inv(FX.data(), xw.data());
         for (int q = 0; q < N; ++q) { acc[q] += xw[q] * win[q]; wacc[q] += win[q] * win[q]; }
+        if (pre && !callHook) for (int q = 0; q < N; ++q) accP[q] += xw[q] * win[q];       // 回调没调：回调前 = 回调后
         for (int q = 0; q < H; ++q) out[q] = wacc[q] > 1e-8f ? acc[q] / wacc[q] : 0.f;
+        if (pre) for (int q = 0; q < H; ++q) pre[q] = wacc[q] > 1e-8f ? accP[q] / wacc[q] : 0.f;
         memmove(acc.data(), acc.data() + H, (N - H) * 4); memset(acc.data() + N - H, 0, H * 4);
+        if (pre) { memmove(accP.data(), accP.data() + H, (N - H) * 4); memset(accP.data() + N - H, 0, H * 4); }
         memmove(wacc.data(), wacc.data() + H, (N - H) * 4); memset(wacc.data() + N - H, 0, H * 4);
     }
 };

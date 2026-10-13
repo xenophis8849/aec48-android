@@ -1,5 +1,5 @@
 /*
- * aec48 0.4.3 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.5 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -61,6 +61,30 @@ AEC48_EXPORT int aec48_dump_status(const Aec48* a);
 AEC48_EXPORT void aec48_stats(const Aec48* a, double out4[4]);
 
 AEC48_EXPORT void aec48_destroy(Aec48* a);
+
+/* ———— 频谱回调（0.5 起）：在本库的输出频谱上串接其他处理（例如降噪），不额外增加延迟 ————
+ * 本库每处理一帧（每 hop 个样本一帧），在把输出频谱合成回波形之前调用一次回调，回调可原地修改频谱。
+ * 帧格式（aec48_spec_format 查询）：
+ *   窗长 nfft = 1536、帧移 hop = 384（48 kHz 与 44.1 kHz 都按样本数计）；频点数 bins = nfft/2 + 1 = 769（0 = 直流，768 = 奈奎斯特）。
+ *   窗：周期 sqrt-Hann，w[i] = sqrt(0.5·(1 − cos(2π·i/nfft)))，分析与合成同一个窗（window_id = AEC48_WINDOW_SQRT_HANN_PERIODIC）。
+ *   频谱 = 加窗帧的不归一化 DFT（负指数，X[k] = Σ w[n]x[n]e^{−j2πkn/nfft}），波形满幅 ±1.0。
+ *   合成 = IDFT/nfft，乘窗重叠相加，再除以窗平方的重叠和。回调返回后直流与奈奎斯特的虚部被置 0。
+ * 频谱内容：回声消除开时为消除后的输出（近端人声 + 背景噪声，本库不降噪）；aec48_set_enabled(a, 0) 直通时为麦克风原始频谱。两种情况回调都会被调用。
+ * 回调在 aec48_process 的调用线程里同步执行：不得分配内存、加锁、读写文件或阻塞；其耗时计入 aec48_stats 的每块耗时。
+ * 处理开始的前两块（凑不满第一帧）不调用。回调不改变 aec48_latency_samples。 */
+#define AEC48_WINDOW_SQRT_HANN_PERIODIC 1
+typedef void (*aec48_spec_hook)(void* user, float* re, float* im, int bins);
+
+/* 挂上（fn 非空）或摘掉（fn = NULL）频谱回调；user 原样传给回调。
+ * 只能在没有 aec48_process 进行中、也没有在录音时调用。返回 0 成功；-1 参数无效；-2 检测到 process 正在进行；-3 正在录音（先 dump_stop）。
+ * 挂着回调时开始录音（aec48_dump_start），会另写 out_prehook.wav = 回调之前的输出（与 out.wav 同一时间轴），便于分清问题出在哪一级；meta.json 的 spec_hook 记录挂接与开关状态。 */
+AEC48_EXPORT int aec48_set_spec_hook(Aec48* a, aec48_spec_hook fn, void* user);
+
+/* 回调开关：1 = 调用（默认），0 = 跳过（输出与没挂回调时逐样本相同）。可在任意线程调用，下一帧生效；录音中切换会记进 meta.json 的 events。 */
+AEC48_EXPORT void aec48_set_spec_hook_enabled(Aec48* a, int on);
+
+/* 查询帧格式：采样率、窗长、帧移、窗型编号。串接方据此核对自己的格式，对不上就不要挂。 */
+AEC48_EXPORT void aec48_spec_format(const Aec48* a, int* sample_rate, int* nfft, int* hop, int* window_id);
 
 /* 版本与模型标识，例如 "aec48 0.1 (lin nlinBc3-dual, mask v59ae20)"。 */
 AEC48_EXPORT const char* aec48_version(void);
