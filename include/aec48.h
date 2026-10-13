@@ -83,7 +83,7 @@ typedef void (*aec48_spec_hook)(void* user, float* re, float* im, int bins);
  * 挂着回调时开始录音（aec48_dump_start），会另写 out_prehook.wav = 回调之前的输出（与 out.wav 同一时间轴），便于分清问题出在哪一级；meta.json 的 spec_hook 记录挂接与开关状态。 */
 AEC48_EXPORT int aec48_set_spec_hook(Aec48* a, aec48_spec_hook fn, void* user);
 
-/* 回调开关：1 = 调用（默认），0 = 跳过（输出与没挂回调时逐样本相同）。只写原子量，可在任意线程（含音频线程）调用，下一块生效；
+/* 回调开关：1 = 调用（默认），0 = 跳过（下一块起不再调用；运行中关掉时，输出要经 3 块重叠相加过渡才与没挂回调时逐样本相同，即录音事件的 out_from 到 out_full；从一开始就关着则始终相同。重新打开同样有 3 块过渡）。只写原子量，可在任意线程（含音频线程）调用；
  * 录音中的切换由处理线程在生效的那一块记进 meta.json 的 events。 */
 AEC48_EXPORT void aec48_set_spec_hook_enabled(Aec48* a, int on);
 

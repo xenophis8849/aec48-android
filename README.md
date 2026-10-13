@@ -74,7 +74,7 @@ aec48_destroy(aec);
 | `int aec48_dump_status(const Aec48*)` | 上一次录音的写盘结果（stop 之后查）：0 正常，−4 有写盘错误。 |
 | `void aec48_stats(const Aec48*, double out4[4])` | 最近一秒：[0] 每块平均处理耗时 ms，[1] 最大 ms，[2] 已处理样本数，[3] 录音丢块数。 |
 | `int aec48_set_spec_hook(Aec48*, aec48_spec_hook fn, void* user)` | 挂上（`fn` 非空）或摘掉（`fn` = NULL）频谱回调，见「串接其他处理」。只能在没有 `process` 进行中、也没在录音时调用。返回 0 成功、−1 参数无效、−2 检测到 `process` 正在进行、−3 正在录音。 |
-| `void aec48_set_spec_hook_enabled(Aec48*, int on)` | 回调开关：1 = 调用（默认），0 = 跳过（输出与没挂时逐样本相同）。任意线程，下一帧生效。 |
+| `void aec48_set_spec_hook_enabled(Aec48*, int on)` | 回调开关：1 = 调用（默认），0 = 跳过（下一块起不再调用；运行中关掉时，输出要经 3 块重叠相加过渡才与没挂回调时逐样本相同，即录音事件的 out_from 到 out_full；从一开始就关着则始终相同。重新打开同样有 3 块过渡）。任意线程（含音频线程）。 |
 | `void aec48_spec_format(const Aec48*, int* sample_rate, int* nfft, int* hop, int* window_id)` | 查询回调里频谱的帧格式。 |
 | `void aec48_destroy(Aec48*)` | 释放（录音中会先停止录音）。 |
 | `const char* aec48_version(void)` | 版本与模型标识。 |
@@ -138,7 +138,7 @@ void my_spec_fn(void* user, float* re, float* im, int bins) { /* 原地修改 re
 - 回调在音频线程里执行：不得分配内存、加锁、读写文件或阻塞。回调耗时计入 `aec48_stats` 的每块耗时。
 - 回调需逐帧因果：拿到第 t 帧就给出第 t 帧的结果，不能等后面的帧，否则就不再是「不增加延迟」。
 - 挂着回调时库多维护一路「回调前」的输出（见「录音」的 `out_prehook.wav`）：回调开着时多一次逆变换，关着时只多一次重叠相加。不挂回调时没有这份开销（摘掉后再维护 4 块，保证马上重新挂上时状态也是对的）。开销实测见「版本与模型」0.5.1。
-- 运行中临时停用：`aec48_set_spec_hook_enabled(a, 0)`（可在音频线程调），输出与没挂时逐样本相同；重新打开后 3 帧（重叠相加的过渡）内完全切换。
+- 运行中临时停用：`aec48_set_spec_hook_enabled(a, 0)`（可在音频线程调），下一块起不再调用回调；输出经 3 块重叠相加过渡（`out_from` 到 `out_full`）后与没挂回调时逐样本相同。重新打开同样有 3 块过渡。需要「立即」旁路的场景（例如回调出错时）要算上这段过渡。
 
 ---
 
@@ -236,7 +236,7 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 
 也可以用 ThreadSanitizer 构建跑这个测试查线程竞态（`-DCMAKE_CXX_FLAGS=-fsanitize=thread` 等，0.3、0.5 无告警）。
 
-`test/aec48_hook` 检查频谱回调（主机与手机都能跑，全部通过返回 0）：格式查询；直通时回调拿到的频谱与按上表格式自己算的 DFT 一致（相对误差 ≤ 1e−4）；恒等回调输出与不挂时逐样本相同、每帧恰好调用一次；回调乘 0.5 / 置零时输出相应变化；开关关掉等于没挂、中途打开后与一直开着一致；录音中挂接返回 −3；挂着回调录音时 `out.wav` / `out_prehook.wav` 分别等于回调后 / 回调前的输出。第 4 个参数写 `bench` 时只测挂与不挂的每块耗时。
+`test/aec48_hook` 检查频谱回调（主机与手机都能跑，全部通过返回 0）：格式查询；直通时回调拿到的频谱与按上表格式自己算的 DFT 一致（相对误差 ≤ 1e−4）；恒等回调输出与不挂时逐样本相同、每帧恰好调用一次；回调乘 0.5 / 置零时输出相应变化；从一开始就关着等于没挂、中途打开后与一直开着一致、运行中关掉后从 `out_full` 起等于没挂（H-12）；录音中挂接返回 −3；挂着回调录音时 `out.wav` / `out_prehook.wav` 分别等于回调后 / 回调前的输出。第 4 个参数写 `bench` 时只测挂与不挂的每块耗时。
 
 ```sh
 ./build-host/aec48_hook test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm 48000 /tmp/aec48_hook_dir   # 目录需已存在
@@ -335,6 +335,7 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
   - 帧时序说明更正：第 1 块不调用回调、从第 2 块起每块一次（0.5 / 0.5.1 误写为「前两块不调用」）；第 c 次调用的窗覆盖输入 [c·384 − 768, c·384 + 768)，torch 等价写法要先左补 768 个零。
   - 录音事件的位置说明更正并补字段：`pos` 所在的时间轴含被丢弃的段；输出从 `out_from` = `pos + latency − 1536` 就开始变化（0.5.1 误写为 `pos + latency`），到 `out_full` = `pos + latency − 384` 起完全切换，两个位置直接写进每条事件。
   - 测试：`aec48_hook` 加 H-12（按实际输出核对 `out_from` / `out_full`，不垫块与垫一块两种）；`aec48_robust` 的 M-06 在输入短于 450 块时循环取块（之前会越界读）。
+  - 之后补订（复审第三轮，库不变）：关掉回调的说明更正为「输出经 3 块过渡后才与没挂时相同」（之前写成立即相同）；`aec48_hook` 的 H-8 / H-12 按输入长度取切换帧、输入不够时跳过（之前短输入会越界读）。
 - 0.5.1 修改（按 0.5 的独立审查）：
   - `aec48_set_enabled` / `aec48_set_spec_hook_enabled` 改为只写原子量。0.5 及更早在录音中调用会加锁并分配内存（`aec48_set_enabled` 从 0.1 起如此），在音频线程里调用有卡顿风险。录音事件改由处理线程在块边界记进预分配的表，`pos` 精确到生效的那一块（以前是调用开关时那次 `process` 的末尾），新增 `events_overflow`。
   - 「回调前」那路只在挂着回调时维护（0.5 不挂时也有一次拷贝），摘掉后再维护 4 块：0.5 在摘掉后马上重新挂上时，从回调后的状态拷贝，`out_prehook.wav` 开头 3 块会偏。

@@ -113,7 +113,7 @@ int main(int argc, char** argv) {
         FILE* f = fopen((d + "/meta.json").c_str(), "rb"); std::string meta; if (f) { char b[4096]; size_t g; while ((g = fread(b, 1, sizeof b, f))) meta.append(b, g); fclose(f); }
         ck(meta.find("\"spec_hook\":{\"attached_at_start\":1") != std::string::npos, "H-7 meta.json 记了 spec_hook", "%.0f", 0);
 
-        {   // H-8：回调在第 f 帧关回调、第 g 帧关回声消除（都是下一块生效）；每次 process 送 10 块，事件仍要落在块上
+        if (blocks < 60) printf("跳过   H-8 输入只有 %ld 块（要 ≥ 60）\n", blocks); else {   // H-8：回调在第 f 帧关回调、第 g 帧关回声消除（都是下一块生效）；每次 process 送 10 块，事件仍要落在块上
             const long f = 37, g = 29; Aec48* b = aec48_create(sr, 3840); Tog t; t.a = b; t.offHookAt = f; t.offAecAt = g;
             aec48_set_spec_hook(b, togFn, &t); aec48_dump_start(b, d.c_str());
             std::vector<float> o2(n, 0.f); for (long i = 0; i + 3840 <= n; i += 3840) aec48_process(b, &mic[i], &ref[i], &o2[i], 3840);
@@ -136,8 +136,9 @@ int main(int argc, char** argv) {
             auto pw = rd((d + "/out_prehook.wav").c_str()); int e = 0;
             for (long i = 0; i + 22 < (long)pw.size() && half + i < n; ++i) e = std::max(e, std::abs(pw[i + 22] - q(base[half + i])));
             ck((long)pw.size() - 22 == n - half && e <= 1, "H-10 摘掉再挂上后录音：out_prehook = 回调前", "(最大差 %.0f LSB)", e); }
-        for (int fpc : {384, 0}) {   // H-12
-            const long f = 40; Aec48* b = aec48_create(sr, fpc); Rec z; z.zero = true;
+        for (int fpc : {384, 0}) {   // H-12（切换帧按输入长度取，过渡区要整个落在输入里；不够就跳过——Codex 复审 0.5.2）
+            const long f = std::min(40L, blocks / 3);
+            if (blocks < 30) { printf("跳过   H-12 输入只有 %ld 块（要 ≥ 30）\n", blocks); break; } Aec48* b = aec48_create(sr, fpc); Rec z; z.zero = true;
             struct ZT { Aec48* a; Rec* z; long fr = 0, offAt; } zt{b, &z, 0, f};
             aec48_set_spec_hook(b, [](void* u, float* re, float* im, int bins) { ZT* t = (ZT*)u; if (t->fr++ == t->offAt) aec48_set_spec_hook_enabled(t->a, 0); hookFn(t->z, re, im, bins); }, &zt);
             aec48_dump_start(b, d.c_str()); std::vector<float> o2(n, 0.f);
