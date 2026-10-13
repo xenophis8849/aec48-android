@@ -11,6 +11,8 @@
 //  H-8 开关事件定位：每次 process 送 10 块；在回调里于第 g 帧关掉回声消除、第 f 帧关掉回调（g < f：回调关掉后就不再被调用） → meta 事件 pos 都 = 生效那一块的末尾（(f+3)·384、(g+3)·384）。
 //  H-9 同一目录：先挂回调录、再摘掉回调录 → 第二次后目录里不再有 out_prehook.wav。
 //  H-11 摘掉、不挂处理 10 块、再挂上后录音：同上。
+//  H-12 事件的输出位置（Codex 复审 0.5.1）：置零回调在第 f 帧把自己关掉，按实际输出核对 meta 的 out_from / out_full——
+//       out_from 之前输出全零、out_from 那一块起不再全零、out_full 起与不挂回调逐样本相同；不垫块（块长 384）与垫一块（声明块长 0）两种都测。
 //  H-10 摘掉再挂上（中间不处理）后录音：out_prehook.wav 仍 = 回调前（Codex 审查 0.5：回调前那路的重叠相加状态不能从回调后的状态拷）。
 #include "aec48.h"
 #include <cstdio>
@@ -116,7 +118,7 @@ int main(int argc, char** argv) {
             aec48_set_spec_hook(b, togFn, &t); aec48_dump_start(b, d.c_str());
             std::vector<float> o2(n, 0.f); for (long i = 0; i + 3840 <= n; i += 3840) aec48_process(b, &mic[i], &ref[i], &o2[i], 3840);
             aec48_dump_stop(b); aec48_destroy(b); std::string m = slurp(d + "/meta.json");
-            char e1[96], e2[96]; snprintf(e1, sizeof e1, "{\"pos\":%ld,\"spec_hook_enabled\":0}", (f + 3) * 384); snprintf(e2, sizeof e2, "{\"pos\":%ld,\"enabled\":0}", (g + 3) * 384);
+            char e1[96], e2[96]; snprintf(e1, sizeof e1, "{\"pos\":%ld,\"spec_hook_enabled\":0,", (f + 3) * 384); snprintf(e2, sizeof e2, "{\"pos\":%ld,\"enabled\":0,", (g + 3) * 384);
             ck(m.find(e1) != std::string::npos && m.find(e2) != std::string::npos && m.find("\"events_overflow\":0") != std::string::npos, "H-8 开关事件落在生效那一块的末尾", "(回调开关 pos %.0f)", (double)(f + 3) * 384);
             if (m.find(e1) == std::string::npos) printf("    meta：%s\n", m.c_str()); }
         {   // H-9：同一目录先挂回调录（上面 H-8 刚录过，有 out_prehook.wav），再不挂回调录
@@ -134,6 +136,22 @@ int main(int argc, char** argv) {
             auto pw = rd((d + "/out_prehook.wav").c_str()); int e = 0;
             for (long i = 0; i + 22 < (long)pw.size() && half + i < n; ++i) e = std::max(e, std::abs(pw[i + 22] - q(base[half + i])));
             ck((long)pw.size() - 22 == n - half && e <= 1, "H-10 摘掉再挂上后录音：out_prehook = 回调前", "(最大差 %.0f LSB)", e); }
+        for (int fpc : {384, 0}) {   // H-12
+            const long f = 40; Aec48* b = aec48_create(sr, fpc); Rec z; z.zero = true;
+            struct ZT { Aec48* a; Rec* z; long fr = 0, offAt; } zt{b, &z, 0, f};
+            aec48_set_spec_hook(b, [](void* u, float* re, float* im, int bins) { ZT* t = (ZT*)u; if (t->fr++ == t->offAt) aec48_set_spec_hook_enabled(t->a, 0); hookFn(t->z, re, im, bins); }, &zt);
+            aec48_dump_start(b, d.c_str()); std::vector<float> o2(n, 0.f);
+            for (long i = 0; i + 384 <= n; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
+            aec48_dump_stop(b); const int lat = aec48_latency_samples(b); aec48_destroy(b);
+            Aec48* c = aec48_create(sr, fpc); std::vector<float> bo(n, 0.f); for (long i = 0; i + 384 <= n; i += 384) aec48_process(c, &mic[i], &ref[i], &bo[i], 384); aec48_destroy(c);
+            const long pos = (f + 3) * 384, from = pos + lat - 1536, full = pos + lat - 384;
+            std::string m = slurp(d + "/meta.json"); char e[160]; snprintf(e, sizeof e, "{\"pos\":%ld,\"spec_hook_enabled\":0,\"out_from\":%ld,\"out_full\":%ld}", pos, from, full);
+            bool zeroBefore = true, moved = false, same = true; for (long i = 0; i < from; ++i) zeroBefore = zeroBefore && o2[i] == 0.f;
+            for (long i = from; i < from + 384; ++i) moved = moved || o2[i] != 0.f; for (long i = full; i < n; ++i) same = same && o2[i] == bo[i];
+            bool sameEarly = true; for (long i = full - 384; i < full; ++i) sameEarly = sameEarly && o2[i] == bo[i];   // 过渡区最后一块不应已经相同（说明 out_full 不是偏早报的）
+            char nm[96]; snprintf(nm, sizeof nm, "H-12 事件输出位置（声明块长 %d，延迟 %d）", fpc, lat);
+            ck(m.find(e) != std::string::npos && zeroBefore && moved && same && !sameEarly, nm, "(out_from %.0f)", (double)from);
+            if (m.find(e) == std::string::npos) printf("    期望 %s\n    meta %s\n", e, m.c_str()); }
         {   // H-11：置零回调处理一段 → 摘掉 → 不挂处理 10 块（> 4 块，走「两路本来相等、直接拷」那条路）→ 挂回 ×1 回调 → 录：out_prehook = 回调前
             Aec48* b = aec48_create(sr, 384); Rec z; z.zero = true; Rec one; aec48_set_spec_hook(b, hookFn, &z);
             const long q1 = (blocks / 4) * 384, q2 = q1 + 10 * 384; std::vector<float> o2(n, 0.f);

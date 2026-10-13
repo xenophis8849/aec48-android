@@ -89,9 +89,10 @@ int main(int argc, char** argv) {
     { Aec48* a = aec48_create(48000, 384); std::vector<float> o(384);
       aec48_set_spec_hook(a, [](void*, float*, float*, int) {}, nullptr);
       std::string d = tmp + "/m06"; mkdir(d.c_str(), 0755); aec48_dump_start(a, d.c_str());
-      for (int i = 0; i < 50; ++i) aec48_process(a, &mic[(size_t)i * 384], &ref[(size_t)i * 384], o.data(), 384);
+      const long nb = n / 384;   // 输入不够 450 块时循环取（Codex 复审：固定次数会越界）
+      for (int i = 0; i < 50; ++i) aec48_process(a, &mic[(size_t)(i % nb) * 384], &ref[(size_t)(i % nb) * 384], o.data(), 384);
       g_news = 0; g_count = true;
-      for (int i = 50; i < 450; ++i) { if (i % 7 == 0) aec48_set_enabled(a, (i / 7) & 1); if (i % 11 == 0) aec48_set_spec_hook_enabled(a, (i / 11) & 1); aec48_process(a, &mic[(size_t)i * 384], &ref[(size_t)i * 384], o.data(), 384); }
+      for (int i = 50; i < 450; ++i) { if (i % 7 == 0) aec48_set_enabled(a, (i / 7) & 1); if (i % 11 == 0) aec48_set_spec_hook_enabled(a, (i / 11) & 1); aec48_process(a, &mic[(size_t)(i % nb) * 384], &ref[(size_t)(i % nb) * 384], o.data(), 384); }
       g_count = false; aec48_dump_stop(a); aec48_destroy(a);
       check(g_news.load() == 0, "M-06 录音中拨开关 + 处理 400 块：operator new 次数为 0", std::to_string(g_news.load())); }
 

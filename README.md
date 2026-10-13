@@ -128,10 +128,10 @@ void my_spec_fn(void* user, float* re, float* im, int bins) { /* 原地修改 re
 | 窗长 `nfft` / 帧移 `hop` | 1536 / 384 样本（48 kHz 与 44.1 kHz 都按样本数计；48 kHz 下每 8 ms 一帧） |
 | 频点数 `bins` | `nfft/2 + 1` = 769（0 = 直流，768 = 奈奎斯特） |
 | 窗（`window_id` = `AEC48_WINDOW_SQRT_HANN_PERIODIC` = 1） | 周期 sqrt-Hann：`w[i] = sqrt(0.5·(1 − cos(2π·i/nfft)))`；分析与合成同一个窗 |
-| 频谱 | 加窗帧的不归一化 DFT，负指数：`X[k] = Σ w[n]·x[n]·e^{−j2πkn/nfft}`，波形满幅 ±1.0。等价于 `torch.stft(x, n_fft=1536, hop_length=384, window=torch.hann_window(1536, periodic=True).sqrt(), center=False, return_complex=True)` |
+| 频谱 | 加窗帧的不归一化 DFT，负指数：`X[k] = Σ w[n]·x[n]·e^{−j2πkn/nfft}`，波形满幅 ±1.0。等价于 `torch.stft(F.pad(x, (768, 0)), n_fft=1536, hop_length=384, window=torch.hann_window(1536, periodic=True).sqrt(), center=False, return_complex=True)` |
 | 合成 | `IDFT / nfft`，乘窗重叠相加，再除以窗平方的重叠和；回调返回后直流与奈奎斯特的虚部被置 0 |
 | 内容 | 回声消除开：消除后的输出（近端人声 + 背景噪声；本库不降噪）。`aec48_set_enabled(a, 0)` 直通：麦克风原始频谱。两种情况回调都会被调用 |
-| 时机 | 每帧一次，在 `aec48_process` 的调用线程里同步执行；开始处理的前两块凑不满第一帧，不调用 |
+| 时机 | 在 `aec48_process` 的调用线程里同步执行。第 1 块不调用；从第 2 块起每块调用一次，第 c 次调用（c 从 0 数）的窗覆盖输入样本 [c·384 − 768, c·384 + 768)，负索引补零——即输入左边补 768 个零后、`center=False` 的第 c 帧（上一行 torch 写法里的 `F.pad`）|
 
 要求与注意：
 
@@ -160,7 +160,7 @@ aec48_dump_stop(aec);
 | `ref.wav` | 参考输入 |
 | `out.wav` | 输出（比 mic 晚 `latency_samples` 个样本） |
 | `out_prehook.wav` | 仅在**录音开始时挂着频谱回调**才有：回调之前的输出（与 `out.wav` 同一时间轴），用来分清问题出在回声消除还是串接的处理 |
-| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间两个开关的切换：`{"pos": 样本位置, "enabled": 0/1}` 或 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`。由处理线程在切换生效的那一块记录，`pos` = 那一块在录音时间轴（`mic.wav` 样本序号）上的末尾；在 `out.wav` 上要再晚 `latency_samples`，回调开关另有约 3 块的重叠相加过渡。最多记 1024 条，更多的计入 `events_overflow`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`）、`spec_hook`（`attached_at_start`：录音开始时是否挂着回调；挂着时另有 `enabled_at_start` 与 `samples_out_prehook`；录音期间 `aec48_set_spec_hook_enabled` 的切换记在 `events`，形如 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`） |
+| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间两个开关的切换：`{"pos": 样本位置, "enabled": 0/1}` 或 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`。由处理线程在切换生效的那一块记录。`pos` = 那一块输入在录音时间轴上的末尾（时间轴含被丢弃的段，与 `dropped` 的 `pos` 同一条；没有丢弃时就是 `mic.wav` 样本序号）。这一块算出的帧当场参与输出合成、且覆盖最近 4 块，所以 `out.wav` 从 `out_from` = `pos + latency − 1536` 开始变化，到 `out_full` = `pos + latency − 384` 起完全是新状态，中间是重叠相加的过渡；两个位置都直接写在事件里。最多记 1024 条，更多的计入 `events_overflow`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`）、`spec_hook`（`attached_at_start`：录音开始时是否挂着回调；挂着时另有 `enabled_at_start` 与 `samples_out_prehook`；录音期间 `aec48_set_spec_hook_enabled` 的切换记在 `events`，形如 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`） |
 
 各路（三路；挂着回调时四路）按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的各路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数；紧挨着的几次丢弃合并成一段），所以三个文件始终等长、互相对齐。`dropped` 最多记 1024 段；更多时 `dropped_overflow` 给出 `{"from_pos": 第一个没记下的位置, "calls": 之后的丢弃次数, "samples": 之后丢的样本数}`——`from_pos` 之前的时间轴可以按 `dropped` 完整还原，之后只知道合计。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，已落盘的部分保留，wav 头与 `meta.json` 里的样本数和文件实际内容一致。建议每次录音使用一个新目录。
 
@@ -330,7 +330,11 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`aec48 0.5.1 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：`aec48 0.5.2 (lin nlinBc3-dual, mask v59ae20)`。
+- 0.5.2 修改（按 0.5.1 的独立复审；处理结果不变，只改说明与录音元数据）：
+  - 帧时序说明更正：第 1 块不调用回调、从第 2 块起每块一次（0.5 / 0.5.1 误写为「前两块不调用」）；第 c 次调用的窗覆盖输入 [c·384 − 768, c·384 + 768)，torch 等价写法要先左补 768 个零。
+  - 录音事件的位置说明更正并补字段：`pos` 所在的时间轴含被丢弃的段；输出从 `out_from` = `pos + latency − 1536` 就开始变化（0.5.1 误写为 `pos + latency`），到 `out_full` = `pos + latency − 384` 起完全切换，两个位置直接写进每条事件。
+  - 测试：`aec48_hook` 加 H-12（按实际输出核对 `out_from` / `out_full`，不垫块与垫一块两种）；`aec48_robust` 的 M-06 在输入短于 450 块时循环取块（之前会越界读）。
 - 0.5.1 修改（按 0.5 的独立审查）：
   - `aec48_set_enabled` / `aec48_set_spec_hook_enabled` 改为只写原子量。0.5 及更早在录音中调用会加锁并分配内存（`aec48_set_enabled` 从 0.1 起如此），在音频线程里调用有卡顿风险。录音事件改由处理线程在块边界记进预分配的表，`pos` 精确到生效的那一块（以前是调用开关时那次 `process` 的末尾），新增 `events_overflow`。
   - 「回调前」那路只在挂着回调时维护（0.5 不挂时也有一次拷贝），摘掉后再维护 4 块：0.5 在摘掉后马上重新挂上时，从回调后的状态拷贝，`out_prehook.wav` 开头 3 块会偏。

@@ -158,7 +158,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.5.1 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.5.2 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -236,8 +236,10 @@ void aec48_dump_stop(Aec48* a) {
         if (a->hookAtStart) fprintf(f, "\"spec_hook\":{\"attached_at_start\":1,\"enabled_at_start\":%d,\"samples_out_prehook\":%ld},", a->hookOnAtStart, a->wav[3].n);
         else fprintf(f, "\"spec_hook\":{\"attached_at_start\":0},");
         fprintf(f, "\"events\":[");
-        // pos = 开关生效的那一块在录音时间轴（mic.wav 样本序号）上的末尾；在 out.wav 上要再晚 latency_samples，回调开关另有约 3 块的重叠相加过渡
-        for (int i = 0; i < a->nEv; ++i) fprintf(f, "%s{\"pos\":%ld,\"%s\":%d}", i ? "," : "", a->evs[i].pos, a->evs[i].kind ? "spec_hook_enabled" : "enabled", a->evs[i].val);
+        // pos = 开关生效的那一块输入在录音时间轴上的末尾（时间轴含被丢弃的段，与 dropped 的 pos 同一条）。
+        // 这一块算出的帧当场参与输出合成、且覆盖最近 4 块，所以输出从 out_from = pos + latency − 4H 开始变化，到 out_full = pos + latency − H 起完全是新状态（Codex 复审 0.5.1）
+        const long L4 = (long)a->lat - 4L * a->H, L1 = (long)a->lat - a->H;
+        for (int i = 0; i < a->nEv; ++i) fprintf(f, "%s{\"pos\":%ld,\"%s\":%d,\"out_from\":%ld,\"out_full\":%ld}", i ? "," : "", a->evs[i].pos, a->evs[i].kind ? "spec_hook_enabled" : "enabled", a->evs[i].val, a->evs[i].pos + L4, a->evs[i].pos + L1);
         // 整包丢弃（写盘跟不上）：pos = 录音时间轴上的样本位置，n = 丢的样本数（三路同时丢，文件里直接缺这一段；相邻丢包已合并成一段）。
         // 段数超过 1024 时 dropped_overflow 给出第一个没记下的位置与之后的合计：from_pos 之前的时间轴可完整恢复，之后不能逐段恢复
         fprintf(f, "],\"events_overflow\":%ld,\"dropped\":[", a->evOverflow);

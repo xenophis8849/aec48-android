@@ -1,5 +1,5 @@
 /*
- * aec48 0.5.1 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.5.2 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -71,7 +71,10 @@ AEC48_EXPORT void aec48_destroy(Aec48* a);
  *   合成 = IDFT/nfft，乘窗重叠相加，再除以窗平方的重叠和。回调返回后直流与奈奎斯特的虚部被置 0。
  * 频谱内容：回声消除开时为消除后的输出（近端人声 + 背景噪声，本库不降噪）；aec48_set_enabled(a, 0) 直通时为麦克风原始频谱。两种情况回调都会被调用。
  * 回调在 aec48_process 的调用线程里同步执行：不得分配内存、加锁、读写文件或阻塞；其耗时计入 aec48_stats 的每块耗时。
- * 处理开始的前两块（凑不满第一帧）不调用。回调不改变 aec48_latency_samples。 */
+ * 帧时序：第 1 块不调用；从第 2 块起每块调用一次。第 c 次调用（c 从 0 数）的窗覆盖输入样本 [c·hop − 768, c·hop + 768)，即输入左边补 768 个零后
+ *   第 c 个 center=False 的帧（hop = 384、nfft = 1536）。回调不改变 aec48_latency_samples。
+ * 录音 meta.json 的 events：pos = 切换生效那一块输入在录音时间轴上的末尾（时间轴含被丢弃的段，与 dropped 同一条）；
+ *   out_from = pos + latency − 4·hop 起输出开始变化，out_full = pos + latency − hop 起完全是新状态（中间是重叠相加的过渡）。 */
 #define AEC48_WINDOW_SQRT_HANN_PERIODIC 1
 typedef void (*aec48_spec_hook)(void* user, float* re, float* im, int bins);
 
