@@ -76,6 +76,9 @@ AEC48_EXPORT void aec48_destroy(Aec48* a);
  * 录音 meta.json 的 events：pos = 切换生效那一块输入在录音时间轴上的末尾（时间轴含被丢弃的段，与 dropped 同一条）；
  *   out_from = pos + latency − 4·hop 起输出开始变化，out_full = pos + latency − hop 起完全是新状态（中间是重叠相加的过渡）。 */
 #define AEC48_WINDOW_SQRT_HANN_PERIODIC 1
+/* 联动契约版本：帧格式、调用时序、线程要求、开关语义、录音元数据任何一项改动都要提升，并在 README「⚠ 联动接口」一节的变更记录里用【联动】标出。
+ * 串接方（如降噪库的频谱档）可在编译时核对：#if AEC48_SPEC_CONTRACT_VERSION != 1 … #error … #endif */
+#define AEC48_SPEC_CONTRACT_VERSION 1
 typedef void (*aec48_spec_hook)(void* user, float* re, float* im, int bins);
 
 /* 挂上（fn 非空）或摘掉（fn = NULL）频谱回调；user 原样传给回调。
