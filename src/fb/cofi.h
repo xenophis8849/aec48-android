@@ -181,7 +181,7 @@ struct Cofi {
             em[f] = std::sqrt(pe); ym[f] = std::sqrt(py); rh[f] = pe / (pe + py + 1e-9f); }
         if (hint) { if (!sx) die("提示版需要对齐参考谱 sx"); for (int f = 0; f < F; ++f) xm[f] = std::sqrt(sx[2 * f] * sx[2 * f] + sx[2 * f + 1] * sx[2 * f + 1] + 1e-12f); hintStep(); }
         const int NC = hint ? 4 : 3, NFc = hint ? 8 : 7;
-        const int Fh = F - F0; const float* src[4] = {&em[0], &ym[0], &rh[0], &hm[0]};
+        const int Fh = F - F0; const float* src[4] = {&em[0], &ym[0], &rh[0], hm.data()};   // 默认版 hm 为空（NC = 3 不读第四路），不能写 &hm[0]
         for (int c = 0; c < NC; ++c) { const float* xs = src[c]; float* yc = &xc0[c * FE]; memcpy(yc, xs, F0 * 4); for (int r = 0; r < 64; ++r) { float a = 0; const float* wr = erb + r * Fh; for (int k = es[r]; k < ee[r]; ++k) a += wr[k] * xs[F0 + k]; yc[F0 + r] = a; } }
         for (int i = 0; i < 2 * FE; ++i) xc0[i] = std::log(std::max(xc0[i], 1e-8f)) * LG;
         if (hint) for (int i = 3 * FE; i < 4 * FE; ++i) xc0[i] = std::log(std::max(xc0[i], 1e-8f)) * LG;   // 提示通道取对数；ρ 不取

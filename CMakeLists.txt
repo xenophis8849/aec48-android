@@ -26,7 +26,10 @@ target_compile_definitions(kleidiai PRIVATE NDEBUG)
 set_target_properties(kleidiai PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # 内嵌模型：默认 src/models.cpp（掩码 v59ae20）；0.6 起候选版 -DAEC48_MODELS=src/models_v62b.cpp（掩码 v62be20，接口与默认版完全相同）
-set(AEC48_MODELS src/models.cpp CACHE STRING "内嵌模型源文件（tools/embed_models.py 生成）")
+# 父工程先 set(AEC48_MODELS …) 再 add_subdirectory 时保留它（cmake_minimum_required 3.18 下 CMP0126 为 OLD，直接建同名缓存项会把普通变量清掉）
+if(NOT DEFINED AEC48_MODELS)
+  set(AEC48_MODELS src/models.cpp CACHE STRING "内嵌模型源文件（tools/embed_models.py 生成）")
+endif()
 add_library(aec48 SHARED src/aec48.cpp ${AEC48_MODELS})
 target_include_directories(aec48 PUBLIC include PRIVATE src)
 # 与端上核对版 chain_d 同编译选项：-O3 -ffast-math，时延估计用 float
