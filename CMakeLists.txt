@@ -25,7 +25,9 @@ target_compile_options(kleidiai PRIVATE -O3)
 target_compile_definitions(kleidiai PRIVATE NDEBUG)
 set_target_properties(kleidiai PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-add_library(aec48 SHARED src/aec48.cpp src/models.cpp)
+# 内嵌模型：默认 src/models.cpp（掩码 v59ae20）；0.6 起候选版 -DAEC48_MODELS=src/models_v62b.cpp（掩码 v62be20，接口与默认版完全相同）
+set(AEC48_MODELS src/models.cpp CACHE STRING "内嵌模型源文件（tools/embed_models.py 生成）")
+add_library(aec48 SHARED src/aec48.cpp ${AEC48_MODELS})
 target_include_directories(aec48 PUBLIC include PRIVATE src)
 # 与端上核对版 chain_d 同编译选项：-O3 -ffast-math，时延估计用 float
 target_compile_options(aec48 PRIVATE -O3 -ffast-math -fvisibility=hidden)

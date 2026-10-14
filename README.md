@@ -14,7 +14,8 @@
 |---|---|
 | `include/aec48.h` | 全部接口（C） |
 | `prebuilt/arm64-v8a/libaec48.so`、`prebuilt/armeabi-v7a/libaec48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
-| `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型） |
+| `prebuilt/candidate-v62b/<ABI>/libaec48.so` | 候选版预编译库（0.6 起，掩码 v62be20；接口与默认版相同，见「候选版」） |
+| `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型，`models_v62b.cpp` 候选版内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
 | `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/aec48_oom.cpp`、`test/aec48_hook.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、内存分配失败注入（Linux 主机）、频谱回调测试、上传工具测试、测试向量 |
@@ -38,13 +39,22 @@ target_include_directories(your_audio PRIVATE ${AEC48_DIR}/include)
 target_link_libraries(your_audio aec48)
 ```
 
+### 候选版（0.6 起）
+
+`prebuilt/candidate-v62b/<ABI>/libaec48.so` 换了一个掩码模型（v62be20），用来和默认版对比试用。头文件、接口、延迟、频谱回调契约都与默认版相同，把 `.so` 换成候选版即可，代码不用改。两版的区别：
+
+- 候选版的掩码多用两路输入：参考信号按线性级估出的时延挪齐后的频谱，以及由它与线性级输出算出的残余回声估计。两路都在库内部从已有的 `mic` / `ref` 算出，接入方不需要多提供任何数据。
+- 效果：回声为主的时段残留更少（测试向量见「自检」：远端单讲整段消除量 8.2 → 13.0 dB）。
+- 区分版本：`aec48_version()` 返回 `aec48 0.6.0 (lin nlinBc3-dual, mask v62be20 candidate)`，录音的 `meta.json` 的 `version` 同此，回传的录音可据此分辨用的是哪一版。
+- 库文件大小、内存与默认版基本相同（arm64 2.0 MB；每个实例多约 0.3 MB）。
+
 ### 从源码编译
 
 ```sh
-ANDROID_NDK=/path/to/ndk tools/build_android.sh      # 产出 prebuilt/arm64-v8a、prebuilt/armeabi-v7a
+ANDROID_NDK=/path/to/ndk tools/build_android.sh      # 产出默认版 prebuilt/<ABI>/ 与候选版 prebuilt/candidate-v62b/<ABI>/（arm64-v8a、armeabi-v7a）
 ```
 
-也可以直接把本仓库作为子目录 `add_subdirectory()` 进自己的 CMake 工程（目标名 `aec48`）。
+也可以直接把本仓库作为子目录 `add_subdirectory()` 进自己的 CMake 工程（目标名 `aec48`）；要候选版时先设 `set(AEC48_MODELS src/models_v62b.cpp)` 或在命令行加 `-DAEC48_MODELS=src/models_v62b.cpp`。
 
 ### 最小调用
 
@@ -247,6 +257,19 @@ adb shell 'cd /data/local/tmp/aec48 && chmod +x aec48_check && LD_LIBRARY_PATH=.
 | `00t5hG031EmZ` | 48 kHz | 7.62 dB |
 | `03ra86gHhkWD_*441` | 44.1 kHz（块长 441） | 7.77 dB |
 
+候选版用 `_v62b` 结尾的期望输出（主机上按 `-DAEC48_MODELS=src/models_v62b.cpp` 另编一份，例如 `build-host-v62b`）：
+
+```sh
+cmake -S . -B build-host-v62b -DCMAKE_BUILD_TYPE=Release -DAEC48_MODELS=src/models_v62b.cpp && cmake --build build-host-v62b
+./build-host-v62b/aec48_check test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm 48000 test/vec/03ra86gHhkWD_expected48k_v62b.pcm 384
+```
+
+| 测试向量（候选版） | 采样率 | 期望整段消除量 |
+|---|---|---|
+| `03ra86gHhkWD`（`_expected48k_v62b`） | 48 kHz | 12.97 dB |
+| `00t5hG031EmZ`（`_expected48k_v62b`） | 48 kHz | 8.05 dB |
+| `03ra86gHhkWD_*441`（`_expected441_v62b`） | 44.1 kHz（块长 441） | 10.26 dB |
+
 通过标准：整段消除量与期望相差 ≤ 1 dB，且与期望输出的差值能量低 ≥ 20 dB。不同 CPU 的浮点差会让自适应滤波器走出略有不同的轨迹，所以不要求逐样本相同。期望输出与写出的输出都已按延迟挪齐到 mic 的时间轴。测试向量取自公开的 AEC Challenge 盲测集（远端单讲），int16 原始 PCM，单声道。
 
 设置环境变量 `AEC48_DUMP_DIR=<目录>` 时，自检会同时验证录音功能（中途切一次直通，`meta.json` 里应有一条 `events`）。
@@ -299,6 +322,7 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 | | 小核 Cortex-A55 1.7 GHz | arm64-v8a | 49.7% | 3.90 / 5.38 / 7.5 | 0 | 0.249 |
 | | | armeabi-v7a | 61.6% | 4.88 / 5.50 / 6.9 | 0 | 0.338 |
 
+- 候选版（0.6）：手机上还没测。它每块比默认版多一次 FFT 和 48 个频带的递推，电脑上（x86，全速）每块平均 0.10 vs 0.10 ms、p99 0.20 vs 0.19 ms，分不出差别；手机上请用候选版的 `aec48_bench` 按上面的测法测一遍。
 - 内存：每个实例常驻约 5.3–6.0 MB；开录音（`aec48_dump_start`）后另加约 6 MB 录音缓冲（第一次录音时分配）。内嵌模型在库文件里：arm64 1.9 MB、armv7 1.7 MB。
 - S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.027，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
 - 小核上平均耗时约 3.4–3.9 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核约 0.1%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
@@ -354,7 +378,13 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：`aec48 0.5.2 (lin nlinBc3-dual, mask v59ae20)`。
+- 当前：默认版 `aec48 0.6.0 (lin nlinBc3-dual, mask v59ae20)`；候选版 `aec48 0.6.0 (lin nlinBc3-dual, mask v62be20 candidate)`。
+- 0.6 修改（默认版处理结果不变：三个测试向量输出与 0.5.2 逐字节相同；接口、延迟、频谱回调契约不变，契约版本仍为 1）：
+  - 新增候选版预编译库 `prebuilt/candidate-v62b/`（见「快速开始 · 候选版」）。掩码内核支持带「残余回声提示」的模型（参数文件带 `hint_v1` 时自动启用），处理链为它多算一路对齐参考频谱（每块多一次 FFT）。
+  - 对齐参考：参考按线性级每帧的时延挪齐后做同一 STFT。窗内最后一跳的时延在当帧还没估出，用当帧的时延代替；时延不变时与训练 / 评估的算法逐样本相同，只在时延改判前后一两帧有差别。
+  - 核对：掩码内核与训练框架里的模型逐帧比，最大差 5×10⁻⁵（输出幅度 17）；故意喂错对齐参考时差到 1，说明核对能发现输入错误。对齐参考频谱与评估流程逐帧比，时延相同的帧差值能量低 120 dB 以上。
+  - 测试：候选版另有三条期望输出（`test/vec/*_v62b.pcm`）；`aec48_robust`、`aec48_hook`、`aec48_oom` 两版都全部通过。
+  - `tools/embed_models.py` 可指定输出文件；CMake 加 `AEC48_MODELS` 选内嵌模型；`tools/build_android.sh` 同时编两版。
 - 0.5.2 修改 **【联动】**（按 0.5.1 的独立复审；处理结果不变，只改说明与录音元数据；契约变更见联动接口一节）：
   - 帧时序说明更正：第 1 块不调用回调、从第 2 块起每块一次（0.5 / 0.5.1 误写为「前两块不调用」）；第 c 次调用的窗覆盖输入 [c·384 − 768, c·384 + 768)，torch 等价写法要先左补 768 个零。
   - 录音事件的位置说明更正并补字段：`pos` 所在的时间轴含被丢弃的段；输出从 `out_from` = `pos + latency − 1536` 就开始变化（0.5.1 误写为 `pos + latency`），到 `out_full` = `pos + latency − 384` 起完全切换，两个位置直接写进每条事件。
@@ -394,7 +424,7 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
   - 关闭回声消除时残余抑制也照常运行，切回开时无需预热。
   - 上传工具：缺文件计为失败；已上传标记与文件大小、修改时间绑定。
   - 新增 `test/aec48_robust`。
-- 换模型：把新的模型文件放进 `models/`，运行 `tools/embed_models.py <线性级模型> <掩码模型> "<模型标识>"` 重新生成 `src/models.cpp`，再编译。接口不变。
+- 换模型：把新的模型文件放进 `models/`，运行 `tools/embed_models.py <线性级模型> <掩码模型> "<模型标识>" [输出文件]` 重新生成 `src/models.cpp`（或另一个文件，再用 `-DAEC48_MODELS=` 选它），再编译。接口不变。
 
 ---
 

@@ -1,5 +1,8 @@
 // 处理链的流式包装：线性级（fb/nlin.h）→ 残余回声抑制（fb/cofi.h），两级共用一次 STFT（N=1536 / H=384，sqrt-hann）。
 // 每来 H 个样本推一帧：第 k 块到齐后算第 k−2 帧（窗 = 最近 4 块，开头不足补零），算完后第 k−4 块的输出定稿 → 输出比输入晚 3 块（1152 样本）。
+// 提示版掩码（参数文件带 hint_v1，0.6 起，如 v62be20）另吃「对齐参考谱」：参考按线性级逐帧时延（lf 帧）挪到回归量起点后的同一 STFT，
+//   = 评估里 nlin_bin.py 的第 4 个输出（每跳 j 的样本用第 j 帧的 lf）再做 STFT。窗内最后一跳（第 t+1 跳）的 lf 端上还没算出，用本帧 lf 代替——
+//   时延不变时与评估逐样本相同，只在时延改判的那几帧有差别。参考历史按线性级最大时延 K 帧留够。
 // mode：0 = 直通（输出麦克风，延迟相同）；1 = 只线性级；2 = 整链。切换不清状态。
 // 频谱回调（0.5）：每帧输出频谱在合成前交给 hook 原地修改（各 mode 都调；第 1 块不调，第 2 块起每块一帧，第 c 次调用的窗覆盖输入 [c·H − 768, c·H + 768)，负索引补零）；调完把直流 / 奈奎斯特虚部置 0。
 //   pre 非空时另做一路「回调前」的合成（录音用）：回调开着才多一次逆变换，没挂 / 关着直接复用同一帧（只多一次重叠相加）。
@@ -33,6 +36,7 @@ typedef void (*SpecHook)(void* user, float* re, float* im, int bins);
 struct Chain {
     fb::NlinD lin; fb::Cofi cnet; bool hasMask = false;
     int N = 0, H = 0, F = 0; RFft rf;
+    bool hint = false; std::vector<float> rr, xaw, XAr, XAi, sx; long long nIn = 0; int lfAt[4] = {0, 0, 0, 0};   // 提示版：参考环形历史、对齐参考窗 / 谱
     std::vector<float> win, mh, rh, xw, dw, Xr, Xi, Dr, Di, Er, Ei, se, sy, mo, acc, wacc, hr, hi, xp, accP; std::vector<cf> FX;
     double Pg = -1, GA = 0, GT = 0, sr = 48000; long k = 0;
     float lastLin = 0.f, lastMask = 0.f;   // 上一块线性级 / 掩码耗时 ms（统计用）
@@ -43,6 +47,8 @@ struct Chain {
         lin.setDual(true, 0.2f, 3.f);                       // 双滤波器
         if (maskPath && maskPath[0]) { if (!fb::gtcHasKey(maskPath, "arch_cofi")) return false; cnet.load(maskPath, N); hasMask = true; }
         if (!rf.init(N)) return false;
+        hint = hasMask && cnet.hint;
+        if (hint) { rr.assign((size_t)(lin.K + 8) * H, 0.f); xaw.assign(N, 0.f); XAr.assign(F, 0.f); XAi.assign(F, 0.f); sx.assign(2 * F, 0.f); }
         win.resize(N); for (int i = 0; i < N; ++i) win[i] = std::sqrt(0.5f * (1.f - std::cos(2.f * (float)M_PI * i / N)));
         mh.assign(N, 0.f); rh.assign(N, 0.f); xw.resize(N); dw.resize(N); Xr.resize(F); Xi.resize(F); Dr.resize(F); Di.resize(F); Er.resize(F); Ei.resize(F);
         se.resize(2 * F); sy.resize(2 * F); mo.resize(2 * F); FX.resize(N); acc.assign(N, 0.f); wacc.assign(N, 0.f);
@@ -57,6 +63,7 @@ struct Chain {
     void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr) {
         memmove(mh.data(), mh.data() + H, (N - H) * 4); memcpy(mh.data() + N - H, mic, H * 4);
         memmove(rh.data(), rh.data() + H, (N - H) * 4); memcpy(rh.data() + N - H, ref, H * 4);
+        if (hint) { const size_t RN = rr.size(); for (int q = 0; q < H; ++q) rr[(size_t)((nIn + q) % (long long)RN)] = ref[q]; nIn += H; }
         ++k;
         if (k < 2) { memset(out, 0, H * 4); if (pre) memset(pre, 0, H * 4); return; }
         for (int q = 0; q < N; ++q) { xw[q] = rh[q] * win[q]; dw[q] = mh[q] * win[q]; }
@@ -65,11 +72,19 @@ struct Chain {
         lin.step(Xr.data(), Xi.data(), Dr.data(), Di.data(), rh.data() + N - H, Er.data(), Ei.data());   // blk = 窗内最新一跳 = 本块参考
         auto c1 = std::chrono::steady_clock::now(); lastLin = std::chrono::duration<float, std::milli>(c1 - c0).count();
         // 掩码每帧都跑（含 mode 0 / 1），只按 mode 选输出：A/B 切换时掩码状态始终是新的，切回不需要重新预热；代价是关闭时算力不省
+        if (hint) {   // 对齐参考：本帧 t = k − 2，窗 = 输入 [(k−4)H, kH) 的 4 跳（第 t−2 … t+1 跳），第 j 跳取 ref[n − lf_j·H]
+            const long t = k - 2; lfAt[t % 4] = lin.lfPrev; const long long n0 = (long long)(k - 4) * H; const size_t RN = rr.size();
+            for (int q = 0; q < N; ++q) { const long long n = n0 + q; const long j = (long)(k - 4) + q / H; float v = 0.f;
+                if (n >= 0) { const int lf = j > t ? lfAt[t % 4] : lfAt[j % 4]; const long long src = n - (long long)lf * H; if (src >= 0) v = rr[(size_t)(src % (long long)RN)]; }
+                xaw[q] = v * win[q]; }
+            rf.fwd(xaw.data(), XAr.data(), XAi.data());
+        }
         if (hasMask) {
             const float g = (float)(GT / (std::sqrt(Pg > 0 ? Pg : 1e-8) + 1e-6));
             double p = 0; for (int b = 0; b < F; ++b) p += (b == 0 || b == F - 1 ? 1.0 : 2.0) * ((double)Er[b] * Er[b] + (double)Ei[b] * Ei[b]); p /= (double)N * N * 0.5;
             for (int b = 0; b < F; ++b) { se[2 * b] = Er[b] * g; se[2 * b + 1] = Ei[b] * g; sy[2 * b] = (Dr[b] - Er[b]) * g; sy[2 * b + 1] = (Di[b] - Ei[b]) * g; }
-            cnet.step(se.data(), sy.data(), mo.data());
+            if (hint) for (int b = 0; b < F; ++b) { sx[2 * b] = XAr[b] * g; sx[2 * b + 1] = XAi[b] * g; }
+            cnet.step(se.data(), sy.data(), hint ? sx.data() : nullptr, mo.data());
             const float ig = 1.f / g; for (int b = 0; b < F; ++b) FX[b] = cf(mo[2 * b] * ig, mo[2 * b + 1] * ig);
             if (Pg < 0) { if (p > 1e-8) Pg = p; } else Pg += GA * (p - Pg);
         }

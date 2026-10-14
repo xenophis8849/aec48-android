@@ -158,7 +158,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.5.2 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.6.0 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
