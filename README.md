@@ -18,7 +18,7 @@
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型，`models_v62b.cpp` 候选版内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
-| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/aec48_oom.cpp`、`test/aec48_hook.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、内存分配失败注入（Linux 主机）、频谱回调测试、上传工具测试、测试向量 |
+| `test/aec48_check.cpp`、`test/aec48_bench.cpp`、`test/aec48_robust.cpp`、`test/aec48_oom.cpp`、`test/aec48_hook.cpp`、`test/aec48_hook2.cpp`、`test/aec48_hint.cpp`、`test/Aec48UploaderTest.java`、`test/vec/` | 自检程序、端上测速程序、接口健壮性测试、内存分配失败注入（Linux 主机）、频谱回调测试、上传工具测试、测试向量 |
 | `tools/build_android.sh`、`tools/embed_models.py` | 编译脚本、模型内嵌脚本 |
 | `third_party/pffft/` | FFT 库（BSD 类许可，见其 `LICENSE.txt`） |
 | `third_party/kleidiai/` | Arm KleidiAI 节选：int8 量化打包与点积矩阵乘内核（Apache-2.0） |
@@ -85,7 +85,8 @@ aec48_destroy(aec);
 | `int aec48_dump_start(Aec48*, const char* dir)` / `void aec48_dump_stop(Aec48*)` | 录音：把 mic / ref / out 写成 `dir` 下的 `mic.wav`、`ref.wav`、`out.wav`（16 bit 单声道），停止时另写 `meta.json`。start 返回 0 成功、−1 参数无效、−2 文件打不开、−3 内存或线程创建失败。见「录音与上传」。 |
 | `int aec48_dump_status(const Aec48*)` | 上一次录音的写盘结果（stop 之后查）：0 正常，−4 有写盘错误。 |
 | `void aec48_stats(const Aec48*, double out4[4])` | 最近一秒：[0] 每块平均处理耗时 ms，[1] 最大 ms，[2] 已处理样本数，[3] 录音丢块数。 |
-| `int aec48_set_spec_hook(Aec48*, aec48_spec_hook fn, void* user)` | 挂上（`fn` 非空）或摘掉（`fn` = NULL）频谱回调，见「⚠ 联动接口：频谱回调」。只能在没有 `process` 进行中、也没在录音时调用。返回 0 成功、−1 参数无效、−2 检测到 `process` 正在进行、−3 正在录音。 |
+| `int aec48_set_spec_hook(Aec48*, aec48_spec_hook fn, void* user)` | 挂上（`fn` 非空）或摘掉（`fn` = NULL）第 1 版频谱回调，见「⚠ 联动接口：频谱回调」。只能在没有 `process` 进行中、也没在录音时调用。返回 0 成功、−1 参数无效、−2 检测到 `process` 正在进行、−3 正在录音。 |
+| `int aec48_set_spec_hook2(Aec48*, aec48_spec_hook2 fn, void* user)` | 挂上或摘掉第 2 版频谱回调；与 `aec48_set_spec_hook` 二选一，调用约束与返回码相同。 |
 | `void aec48_set_spec_hook_enabled(Aec48*, int on)` | 回调开关：1 = 调用（默认），0 = 跳过（下一块起不再调用；运行中关掉时，输出要经 3 块重叠相加过渡才与没挂回调时逐样本相同，即录音事件的 out_from 到 out_full；从一开始就关着则始终相同。重新打开同样有 3 块过渡）。任意线程（含音频线程）。 |
 | `void aec48_spec_format(const Aec48*, int* sample_rate, int* nfft, int* hop, int* window_id)` | 查询回调里频谱的帧格式。 |
 | `void aec48_destroy(Aec48*)` | 释放（录音中会先停止录音）。 |
@@ -131,7 +132,7 @@ aec48_destroy(aec);
 >
 > 只改说明、不改行为的更正同样记一条（串接方可能已按旧说明实现）。
 
-**当前契约版本：1**（库 0.5.2 起；`AEC48_SPEC_CONTRACT_VERSION` = 1）。
+**当前契约版本：2**（库 0.7.0 起；`AEC48_SPEC_CONTRACT_VERSION` = 2）。版本 2 包含版本 1 的全部帧格式、时序和回调行为，并增加 `aec48_set_spec_hook2` 与逐帧状态信息；版本 1 回调行为保持不变。
 
 ### 用途与边界
 
@@ -145,7 +146,7 @@ aec48_set_spec_hook(aec, my_spec_fn, my_state);       // 开始处理前挂好
 void my_spec_fn(void* user, float* re, float* im, int bins) { /* 原地修改 re[0..bins)、im[0..bins) */ }
 ```
 
-### 帧格式（契约版本 1）
+### 帧格式（契约版本 1 与 2 共用）
 
 | 项 | 值 |
 |---|---|
@@ -164,6 +165,34 @@ void my_spec_fn(void* user, float* re, float* im, int bins) { /* 原地修改 re
 - 挂着回调时库多维护一路「回调前」的输出（见「录音」的 `out_prehook.wav`）：回调开着时多一次逆变换，关着时只多一次重叠相加。不挂回调时没有这份开销（摘掉后再维护 4 块，保证马上重新挂上时状态也是对的）。开销实测见「版本与模型」0.5.1。
 - 运行中临时停用：`aec48_set_spec_hook_enabled(a, 0)`（可在音频线程调），下一块起不再调用回调；输出经 3 块重叠相加过渡（`out_from` 到 `out_full`）后与没挂回调时逐样本相同。重新打开同样有 3 块过渡。需要「立即」旁路的场景（例如回调出错时）要算上这段过渡。
 
+### 契约版本 2：逐帧状态回调
+
+版本 2 新增 `aec48_set_spec_hook2`。它与 `aec48_set_spec_hook` 互斥：挂上其中一个会摘掉另一个，传 `fn = NULL` 摘掉当前回调。挂接约束、返回码、开关、帧时序、线程要求、帧格式和录音行为均与版本 1 相同。`side` 及其指向的数据只在本次回调执行期间有效；需要留存时由调用方复制。`aec48_spec_hook` 的参数和逐帧行为不变。
+
+```c
+#define AEC48_SPEC_CONTRACT_VERSION 2
+#define AEC48_SIDE_MODE_PASSTHROUGH 0
+#define AEC48_SIDE_MODE_LINEAR      1
+#define AEC48_SIDE_MODE_FULL        2
+typedef struct Aec48SpecSide {
+    int size;                  /* 结构体字节数，便于以后向后追加字段 */
+    int aec_mode;              /* 本帧处理模式：直通 0、只线性级 1、整链 2 */
+    float far_active;          /* 参考端远端活动标志，本版为 0 或 1 */
+    float near_talk;           /* 近端说话概率；本版暂不提供，固定为负值 */
+    const float* resid_echo;   /* 每频点残余回声功率，尺度同 re²+im² */
+    int resid_bins;            /* resid_echo 的元素数，与 bins 相同（当前 769） */
+} Aec48SpecSide;
+typedef void (*aec48_spec_hook2)(void* user, float* re, float* im, int bins,
+                                 const Aec48SpecSide* side);
+int aec48_set_spec_hook2(Aec48* a, aec48_spec_hook2 fn, void* user);
+```
+
+`size` 为 `sizeof(Aec48SpecSide)`，用于识别结构体长度，后续版本只在末尾追加字段。`aec_mode` 是处理链本帧的模式：0 直通、1 只线性级、2 整链；与处理链内部模式一致，`aec48_set_enabled(a, 0)` 对应 0，开启对应 2。`far_active` 是本帧原始参考的加窗频谱总功率活动标志：令 `tot = Σ(|Xr[k]|² + |Xi[k]|²)`，超过 hook2 挂接以来的最大 `tot × 1e−5 + 1e−12` 即为有声；最近 `ceil(1 秒 / hop)` 帧（含本帧）出现过有声则为 1，否则为 0。48 kHz 时窗口为 125 帧，44.1 kHz 时为 115 帧。峰值从挂上 hook2 起统计，只在 hook2 已挂且开关开启时更新；开关关闭时峰值与拖尾计数冻结（不更新、不清零），每次挂上新的 hook2 时清零。单位为无量纲，本版只取 0 或 1，不是概率。
+
+`resid_echo` 指向 `resid_bins` 个非负有限浮点数，当前 `resid_bins = bins = 769`。每项是预计回调收到的频谱中该频点的残余回声功率，单位为未归一化 DFT 的频点幅度平方；尺度与 `re[k]² + im[k]²` 相同。提示在掩码电平归一后的谱上估计，输出已换算回回调频谱的尺度：有提示模型时直接复用 Cofi 本帧的 `hm`（幅度），取 `hm²` 为提示功率（保留模型的数值地板），再除以本帧增益 `g` 的平方；`g` 与本帧送进掩码前的电平归一增益相同。无提示模型时用独立实例对 `Pe = |E|²`、`Px = |XA|²` 同乘增益平方后估计，再除以增益平方。无掩码时增益取 1。算法使用 48 个 ERB 带，范围 40 Hz 至采样率一半、`K = 12`、衰减 0.7、每帧上升 0.5 dB、下降系数 0.3，带内功率均摊到频点。无提示模型参数时也使用同一组固定参数；频率 `f` 的 ERB 为 `21.4·log10(1 + 0.00437f)`，在 `erb(40)` 到 `erb(sr/2)` 间等分 49 个边界；频点 `k` 的频率为 `k·sr/nfft`，按 `searchsorted(right) − 1` 分带并夹在 0 至 47。最终值按本帧实际交给回调的频谱计算：整链且有掩码时 `R̂e[k] × min(1, |FX[k]|²/(|E[k]|² + 1e−20))`；只线性级或整链无掩码时为 `R̂e[k]`；直通时为 `|D[k] − E[k]|² + R̂e[k]`。`D` 是麦克风频谱，`E` 是线性级输出，`FX` 是掩码输出。只挂版本 1 回调或 hook2 开关关闭时，不计算这些附加信息。默认版独立提示在 hook2 关闭期间冻结，重新挂接时清零；候选版直接复用模型提示，提示状态始终随模型运行。默认版首次启用或重新开启 hook2 时，从当时起缓存对齐参考历史，缺少的历史补零；候选版复用处理链已维护的参考历史。`near_talk` 固定为 `−1.0f`，表示当前版本不提供近端说话概率。
+
+录音时挂任一版本的回调都会写 `out_prehook.wav`。`meta.json` 的 `spec_hook` 记录中包含 `contract_version`（1 或 2），标明录音开始时使用的回调契约。
+
 ### 契约变更记录
 
 契约版本从 0.5.2 补订起正式编号；在此之前的 0.5 / 0.5.1 / 0.5.2 统一算作版本 1（接口签名没变，行为与说明的变化都列在下表）。以后按本节开头的规则：改一项就加一行，并提升版本号。
@@ -173,6 +202,7 @@ void my_spec_fn(void* user, float* re, float* im, int bins) { /* 原地修改 re
 | 1 | 0.5 | **【联动】** 新增频谱回调、帧格式查询、回调开关 | 首次提供 |
 | 1 | 0.5.1 | **【联动】** 两个开关改为只写原子量，可在音频线程调；录音事件改由处理线程按块记录 | 行为更安全，接口不变；录音事件的 `pos` 含义变了（见 0.5.2） |
 | 1 | 0.5.2 | **【联动】说明更正（行为不变）**：① 第 1 块不调用、第 2 块起每块调用（之前误写「前两块不调用」）；② 第 c 次调用的窗覆盖输入 [c·384 − 768, c·384 + 768)，torch 等价写法要先左补 768 个零（之前漏了 `F.pad`）；③ 关掉回调后输出有 3 块过渡才与没挂时相同（之前误写「立即相同」）；④ 录音事件加 `out_from` / `out_full` | 按旧说明做逐帧核对的，帧起点会差 768 个样本；按旧说明做「立即旁路」的，要算上 3 块过渡。训练数据只用帧内容、不受①②影响 |
+| 2 | 0.7.0 | **【联动】** 新增 `aec48_set_spec_hook2`、`Aec48SpecSide` 与远端活动、处理模式、残余回声功率字段；`meta.json` 记录 `contract_version` | 第 1 版接口及行为不变；不重编的旧用户不受影响。重编时版本检查应由 `!= 1` 改为 `< 1`（只用第 1 版回调）或 `< 2`（用 hook2），以兼容后续契约版本 |
 
 ---
 
@@ -194,7 +224,7 @@ aec48_dump_stop(aec);
 | `ref.wav` | 参考输入 |
 | `out.wav` | 输出（比 mic 晚 `latency_samples` 个样本） |
 | `out_prehook.wav` | 仅在**录音开始时挂着频谱回调**才有：回调之前的输出（与 `out.wav` 同一时间轴），用来分清问题出在回声消除还是串接的处理 |
-| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间两个开关的切换：`{"pos": 样本位置, "enabled": 0/1}` 或 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`。由处理线程在切换生效的那一块记录。`pos` = 那一块输入在录音时间轴上的末尾（时间轴含被丢弃的段，与 `dropped` 的 `pos` 同一条；没有丢弃时就是 `mic.wav` 样本序号）。这一块算出的帧当场参与输出合成、且覆盖最近 4 块，所以 `out.wav` 从 `out_from` = `pos + latency − 1536` 开始变化，到 `out_full` = `pos + latency − 384` 起完全是新状态，中间是重叠相加的过渡；两个位置都直接写在事件里。最多记 1024 条，更多的计入 `events_overflow`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`）、`spec_hook`（`attached_at_start`：录音开始时是否挂着回调；挂着时另有 `enabled_at_start` 与 `samples_out_prehook`；录音期间 `aec48_set_spec_hook_enabled` 的切换记在 `events`，形如 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`） |
+| `meta.json` | `version`、`sample_rate`、`latency_samples`、`samples`、`samples_mic_ref_out`（三个文件的样本数，正常时相等）、`start_unix_ms`（开始录音的时刻）、`write_error`（1 = 有写盘错误）、`enabled_at_start`、`events`（录音期间两个开关的切换：`{"pos": 样本位置, "enabled": 0/1}` 或 `{"pos": 样本位置, "spec_hook_enabled": 0/1}`。由处理线程在切换生效的那一块记录。`pos` = 那一块输入在录音时间轴上的末尾（时间轴含被丢弃的段，与 `dropped` 的 `pos` 同一条；没有丢弃时就是 `mic.wav` 样本序号）。这一块算出的帧当场参与输出合成、且覆盖最近 4 块，所以 `out.wav` 从 `out_from` = `pos + latency − 1536` 开始变化，到 `out_full` = `pos + latency − 384` 起完全是新状态，中间是重叠相加的过渡；两个位置都直接写在事件里。最多记 1024 条，更多的计入 `events_overflow`）、`dropped` / `dropped_calls` / `dropped_samples`（后台写不及时整包丢弃的位置、次数与样本数，正常为空 / 0 / 0）、`dropped_overflow`（见下，正常为 `null`）、`spec_hook`（`attached_at_start`：录音开始时是否挂着回调；挂着时另有 `enabled_at_start`、`samples_out_prehook` 与 `contract_version`（1 或 2）；录音期间 `aec48_set_spec_hook_enabled` 的切换记在 `events`） |
 
 各路（三路；挂着回调时四路）按"一次 `process` 调用"整包写入：后台写不及时时，这次调用的各路一起丢弃，并记进 `dropped`（`pos` 为录音时间轴上的样本位置，`n` 为丢的样本数；紧挨着的几次丢弃合并成一段），所以三个文件始终等长、互相对齐。`dropped` 最多记 1024 段；更多时 `dropped_overflow` 给出 `{"from_pos": 第一个没记下的位置, "calls": 之后的丢弃次数, "samples": 之后丢的样本数}`——`from_pos` 之前的时间轴可以按 `dropped` 完整还原，之后只知道合计。`aec48_dump_stop` 可以在任意线程调用，它会等正在进行的那次 `process` 写完再收尾。写盘出错（如磁盘满）时 `aec48_dump_status` 返回 −4，已落盘的部分保留，wav 头与 `meta.json` 里的样本数和文件实际内容一致。建议每次录音使用一个新目录。
 
@@ -283,10 +313,12 @@ cmake -S . -B build-host-v62b -DCMAKE_BUILD_TYPE=Release -DAEC48_MODELS=src/mode
 
 也可以用 ThreadSanitizer 构建跑这个测试查线程竞态（`-DCMAKE_CXX_FLAGS=-fsanitize=thread` 等，0.3、0.5 无告警）。
 
-`test/aec48_hook` 检查频谱回调（主机与手机都能跑，全部通过返回 0）：格式查询；直通时回调拿到的频谱与按上表格式自己算的 DFT 一致（相对误差 ≤ 1e−4）；恒等回调输出与不挂时逐样本相同、每帧恰好调用一次；回调乘 0.5 / 置零时输出相应变化；从一开始就关着等于没挂、中途打开后与一直开着一致、运行中关掉后从 `out_full` 起等于没挂（H-12）；录音中挂接返回 −3；挂着回调录音时 `out.wav` / `out_prehook.wav` 分别等于回调后 / 回调前的输出。第 4 个参数写 `bench` 时只测挂与不挂的每块耗时。
+`test/aec48_hook` 检查第 1 版频谱回调；`test/aec48_hook2` 检查第 2 版字段、远端活动时序、残余回声功率、版本互换与录音约束。`test/aec48_hint` 用固定增益的多帧输入核对共享提示算法；加 `-DAEC48_TESTING=ON` 构建时，候选版测试直接核对复用的模型提示功率，要求逐位一致（换算回未缩放尺度时允许浮点舍入误差）。默认版另逐位检查实际带内输入只乘一次本帧 `g²`，并以固定增益检查独立提示先缩放再换算回来的结果与未缩放口径一致（浮点误差内）；无掩码的 `g = 1` 也核对。私有观测口不进对外头文件，默认构建关闭。主机编译后分别运行，全部通过返回 0。
 
 ```sh
 ./build-host/aec48_hook test/vec/03ra86gHhkWD_mic.pcm test/vec/03ra86gHhkWD_ref.pcm 48000 /tmp/aec48_hook_dir   # 目录需已存在
+./build-host/aec48_hook2
+./build-host/aec48_hint
 ```
 
 上传工具的测试（主机上有 JDK 即可，会在本机起一个临时 HTTP 服务）：
@@ -301,7 +333,7 @@ javac -d /tmp/aec48up android/src/com/karaoke/aec48/Aec48Uploader.java test/Aec4
 
 ### 测法
 
-`test/aec48_bench`：按真实节奏每 8 ms 送一块（48 kHz、384 样本），用 `taskset` 把进程钉在指定核心上跑 30 s，统计处理线程的 CPU 时间 / 墙钟时间（= 该核心被占用的比例），以及每块处理耗时与超时（单块超过 8 ms）次数。另以全速（不睡眠）跑 10 s 量实时率。按真实节奏时核心会降频，所以占用率比全速实时率高，前者才反映实际运行时的占用。Galaxy S10 息屏进入打盹状态时，系统不允许把进程钉到中 / 大核（`taskset` 报 Invalid argument），测这几档时须点亮屏幕。
+`test/aec48_bench`：按真实节奏每 8 ms 送一块（48 kHz、384 样本），用 `taskset` 把进程钉在指定核心上跑，统计处理线程的 CPU 时间 / 墙钟时间（= 该核心被占用的比例），以及每块处理耗时与超时次数。末尾增加 `hook_compare` 可在主机上不休眠地交替测第 1 版与第 2 版空回调各 3 轮，复用输入秒数与块长，输出两者每块平均耗时、差值和百分比：`./build-host/aec48_bench mic.pcm ref.pcm 48000 30 0 384 hook_compare`。Galaxy S10 息屏进入打盹状态时，系统不允许把进程钉到中 / 大核（`taskset` 报 Invalid argument），测这几档时须点亮屏幕。
 
 ```sh
 adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> ./aec48_bench 03ra86gHhkWD_mic.pcm 03ra86gHhkWD_ref.pcm 48000 30 1'
@@ -322,7 +354,8 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 | | 小核 Cortex-A55 1.7 GHz | arm64-v8a | 49.7% | 3.90 / 5.38 / 7.5 | 0 | 0.249 |
 | | | armeabi-v7a | 61.6% | 4.88 / 5.50 / 6.9 | 0 | 0.338 |
 
-- 候选版（0.6）：手机上还没测。它每块比默认版多一次 FFT 和 48 个频带的递推，电脑上（x86，全速）每块平均 0.10 vs 0.10 ms、p99 0.20 vs 0.19 ms，分不出差别；手机上请用候选版的 `aec48_bench` 按上面的测法测一遍。
+- 候选版：每块比默认版多一次 FFT 和 48 个频带的递推。电脑上（x86，全速）每块平均 0.10 vs 0.10 ms，分不出差别；S10 小核 armeabi-v7a 全速（`hook_compare`，挂第 1 版空回调）每块 2.50–2.60 vs 默认版 2.15–2.20 ms（约 +15%）。按真实节奏的占用率表尚未对候选版单独测。
+- 第 2 版回调（0.7.0，`hook_compare`：同一进程交替挂第 1 版 / 第 2 版空回调各 3 轮，全速，S10 小核 armeabi-v7a，4 次测量）：默认版多 0.42–0.50 ms / 块（+20–23%），候选版多 0.04–0.07 ms / 块（+2–3%）。默认版的掩码不带残余回声提示，挂第 2 版回调时要另算对齐参考频谱和提示递推；候选版直接复用模型自己的提示。挂第 2 版回调后两版每块总耗时相近（2.56–2.69 ms）。不挂第 2 版回调时没有这部分开销。电脑上（x86，单核全速）：默认版 +10.1 µs / 块（+11.3%），候选版 +1.4 µs / 块（+1.5%）。
 - 内存：每个实例常驻约 5.3–6.0 MB；开录音（`aec48_dump_start`）后另加约 6 MB 录音缓冲（第一次录音时分配）。内嵌模型在库文件里：arm64 1.9 MB、armv7 1.7 MB。
 - S10 的超大核（Kryo 485 Prime）普通进程不能用 `taskset` 绑定，未单独测；"不绑核"一行全速时实时率 0.027，说明全速时被调度到大核，而按真实节奏时负载低、被调度在小核上（占用与小核一行相同）。
 - 小核上平均耗时约 3.4–3.9 ms（每块预算 8 ms），偶有单块超过 8 ms（S10 小核约 0.1%）。处理放在音频回调里时，建议给处理线程留至少一块的缓冲，或让处理线程跑在大 / 中核上（例如使用 Android 性能提示接口 `APerformanceHint`、提高线程优先级）。
@@ -378,7 +411,8 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：默认版 `aec48 0.6.0 (lin nlinBc3-dual, mask v59ae20)`；候选版 `aec48 0.6.0 (lin nlinBc3-dual, mask v62be20 candidate)`。
+- 当前：默认版 `aec48 0.7.0 (lin nlinBc3-dual, mask v59ae20)`；候选版 `aec48 0.7.0 (lin nlinBc3-dual, mask v62be20 candidate)`。
+- 0.7.0 修改 **【联动】**（默认版、候选版处理结果不变）：频谱回调契约升至 2，增加 `aec48_set_spec_hook2` 与 `Aec48SpecSide`，每帧提供处理模式、远端活动和残余回声功率；近端说话概率暂不提供。第 1 版回调行为不变，旧二进制不受影响；重编时契约检查应接受 `AEC48_SPEC_CONTRACT_VERSION >= 1`。录音 `meta.json` 的 `spec_hook` 增加 `contract_version`。
 - 0.6 修改（默认版处理结果不变：三个测试向量输出与 0.5.2 逐字节相同；接口、延迟、频谱回调契约不变，契约版本仍为 1）：
   - 新增候选版预编译库 `prebuilt/candidate-v62b/`（见「快速开始 · 候选版」）。掩码内核支持带「残余回声提示」的模型（参数文件带 `hint_v1` 时自动启用），处理链为它多算一路对齐参考频谱（每块多一次 FFT）。
   - 对齐参考：参考按线性级每帧的时延挪齐后做同一 STFT。窗内最后一跳的时延在当帧还没估出，用当帧的时延代替；时延不变时与训练 / 评估的算法逐样本相同，只在时延改判前后一两帧有差别。

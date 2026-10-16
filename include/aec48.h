@@ -1,5 +1,5 @@
 /*
- * aec48 0.6.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.7.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -77,14 +77,30 @@ AEC48_EXPORT void aec48_destroy(Aec48* a);
  *   out_from = pos + latency − 4·hop 起输出开始变化，out_full = pos + latency − hop 起完全是新状态（中间是重叠相加的过渡）。 */
 #define AEC48_WINDOW_SQRT_HANN_PERIODIC 1
 /* 联动契约版本：帧格式、调用时序、线程要求、开关语义、录音元数据任何一项改动都要提升，并在 README「⚠ 联动接口」一节的变更记录里用【联动】标出。
- * 串接方（如降噪库的频谱档）可在编译时核对：#if AEC48_SPEC_CONTRACT_VERSION != 1 … #error … #endif */
-#define AEC48_SPEC_CONTRACT_VERSION 1
+ * 串接方（如降噪库的频谱档）可在编译时核对：只用第 1 版回调的写 #if AEC48_SPEC_CONTRACT_VERSION < 1，用 hook2 的写 #if AEC48_SPEC_CONTRACT_VERSION < 2，再 #error … #endif */
+#define AEC48_SPEC_CONTRACT_VERSION 2
+#define AEC48_SIDE_MODE_PASSTHROUGH 0
+#define AEC48_SIDE_MODE_LINEAR 1
+#define AEC48_SIDE_MODE_FULL 2
 typedef void (*aec48_spec_hook)(void* user, float* re, float* im, int bins);
+typedef struct Aec48SpecSide {
+    int size;                   /* sizeof(Aec48SpecSide)，以后只往后加字段 */
+    int aec_mode;               /* 本帧处理链模式：0 直通 / 1 只线性级 / 2 整链 */
+    float far_active;           /* 最近 1 秒内参考有声为 1，否则 0；无量纲 */
+    float near_talk;            /* 近端说话概率；本版为 -1.0f，表示不提供 */
+    const float* resid_echo;    /* 本帧回调频谱里的残余回声功率，与 re²+im² 同尺度 */
+    int resid_bins;             /* resid_echo 的元素数，当前等于 bins = 769 */
+} Aec48SpecSide;
+typedef void (*aec48_spec_hook2)(void* user, float* re, float* im, int bins, const Aec48SpecSide* side);
 
 /* 挂上（fn 非空）或摘掉（fn = NULL）频谱回调；user 原样传给回调。
  * 只能在没有 aec48_process 进行中、也没有在录音时调用。返回 0 成功；-1 参数无效；-2 检测到 process 正在进行；-3 正在录音（先 dump_stop）。
  * 挂着回调时开始录音（aec48_dump_start），会另写 out_prehook.wav = 回调之前的输出（与 out.wav 同一时间轴），便于分清问题出在哪一级；meta.json 的 spec_hook 记录挂接与开关状态。 */
 AEC48_EXPORT int aec48_set_spec_hook(Aec48* a, aec48_spec_hook fn, void* user);
+/* 第 2 版回调，与第 1 版互斥；挂任一个会摘掉另一个，fn = NULL 摘掉当前回调，调用约束及返回码相同。
+ * side 及 resid_echo 只在回调期间有效。峰值从挂上 hook2 起统计；只在回调开启时更新，关闭期间峰值与拖尾冻结；重新挂接时清零。
+ * 默认版独立提示在关闭期间冻结、重新挂接时清零；候选版直接复用模型提示，其状态始终随模型运行。算法、单位与尺度详见 README「⚠ 联动接口」。 */
+AEC48_EXPORT int aec48_set_spec_hook2(Aec48* a, aec48_spec_hook2 fn, void* user);
 
 /* 回调开关：1 = 调用（默认），0 = 跳过（下一块起不再调用；运行中关掉时，输出要经 3 块重叠相加过渡才与没挂回调时逐样本相同，即录音事件的 out_from 到 out_full；从一开始就关着则始终相同。重新打开同样有 3 块过渡）。只写原子量，可在任意线程（含音频线程）调用；
  * 录音中的切换由处理线程在生效的那一块记进 meta.json 的 events。 */

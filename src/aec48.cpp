@@ -72,7 +72,7 @@ struct Aec48 {
     std::vector<float> inM, inR, blkO, blkP; int fill = 0; Ring outQ, outP;   // outP：回调前的输出，与 outQ 同步推、同步取
     std::atomic<int> enabled{1};
     std::vector<float> tmpO, tmpP;   // 取输出的中转（H 个，create 时分配）
-    ac::SpecHook hook = nullptr; void* hookUser = nullptr; std::atomic<int> hookOn{1}; std::atomic<int> inProc{0};
+    ac::SpecHook hook = nullptr; aec48_spec_hook2 hook2 = nullptr; void* hookUser = nullptr; std::atomic<int> hookOn{1}; std::atomic<int> inProc{0};
     int preDrain = 0;   // 摘掉回调后还要接着维护「回调前」那路的块数（重叠相加里残留着被回调改过的帧，4 块后两路才相等）
     // 统计
     std::atomic<double> avgMs{0}, maxMs{0}; std::atomic<long> samples{0}, outPadded{0}; double accMs = 0, accMax = 0; long accN = 0; std::chrono::steady_clock::time_point lastStat;
@@ -95,8 +95,8 @@ static void block(Aec48* a, const float* m, const float* r, long evPos) {
     if (evPos >= 0) { if (en != a->evLastEn) { noteEv(a, evPos, 0, en); a->evLastEn = en; } if (ho != a->evLastHo) { noteEv(a, evPos, 1, ho); a->evLastHo = ho; } }
     // 「回调前」那路只在挂着回调、以及摘掉后的 4 块里维护（不挂回调的用户不付这份开销）；其余时候它就等于输出，直接拷。
     // 摘掉后马上重挂时状态仍在维护，不会从回调后的状态拷（Codex 审查 0.5 P2）
-    const bool pre = a->hook || a->preDrain > 0; if (!a->hook && a->preDrain > 0) --a->preDrain;
-    a->chain.push(m, r, a->blkO.data(), en ? 2 : 0, a->hook, a->hookUser, ho != 0, pre ? a->blkP.data() : nullptr);
+    const bool pre = a->hook || a->hook2 || a->preDrain > 0; if (!a->hook && !a->hook2 && a->preDrain > 0) --a->preDrain;
+    a->chain.push(m, r, a->blkO.data(), en ? 2 : 0, a->hook, a->hookUser, ho != 0, pre ? a->blkP.data() : nullptr, a->hook2, a->hookUser);
     if (!pre) memcpy(a->blkP.data(), a->blkO.data(), a->H * 4);
     a->outQ.push(a->blkO.data(), a->H);   // outQ 最多积压 prefill + H，远小于容量
     a->outP.push(a->blkP.data(), a->H);
@@ -158,7 +158,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.6.0 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.7.0 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -199,7 +199,7 @@ int aec48_dump_start(Aec48* a, const char* dir) {
         for (auto& q : a->dq) q.r.store(q.w.load());
         if (a->dbuf.empty()) a->dbuf.assign(1 << 15, 0.f);
         for (auto& w : a->wav) if (w.buf.empty()) w.buf.assign(1 << 15, 0);
-        a->hookAtStart = a->hook != nullptr; a->hookOnAtStart = a->hookOn.load(); a->evLastHo = a->hookOnAtStart; a->nTr = a->hookAtStart ? 4 : 3;
+        a->hookAtStart = a->hook != nullptr || a->hook2 != nullptr; a->hookOnAtStart = a->hookOn.load(); a->evLastHo = a->hookOnAtStart; a->nTr = a->hookAtStart ? 4 : 3;
         // 同一目录上次挂着回调录过：删掉旧的回调前音轨，免得被当成本次的（Codex 审查 0.5）；删不掉（不是「本来就没有」）按文件打不开处理
         if (!a->hookAtStart && ::unlink((std::string(dir) + "/out_prehook.wav").c_str()) != 0 && errno != ENOENT) return -2;
         a->ddir = dir; static const char* nm[4] = {"mic", "ref", "out", "out_prehook"};
@@ -233,8 +233,8 @@ void aec48_dump_stop(Aec48* a) {
         fprintf(f, "{\"version\":\"%s\",\"sample_rate\":%d,\"latency_samples\":%d,\"samples\":%ld,\"samples_mic_ref_out\":[%ld,%ld,%ld],\"start_unix_ms\":%lld,\"write_error\":%d,\"enabled_at_start\":%d,",
                 aec48_version(), a->sr, a->lat, a->wav[0].n, a->wav[0].n, a->wav[1].n, a->wav[2].n, t, werr ? 1 : 0, a->enabledAtStart);
         // 频谱回调：录音开始时挂没挂、开没开；挂着时 out_prehook.wav = 回调前的输出（与 out 同一时间轴）
-        if (a->hookAtStart) fprintf(f, "\"spec_hook\":{\"attached_at_start\":1,\"enabled_at_start\":%d,\"samples_out_prehook\":%ld},", a->hookOnAtStart, a->wav[3].n);
-        else fprintf(f, "\"spec_hook\":{\"attached_at_start\":0},");
+        if (a->hookAtStart) fprintf(f, "\"spec_hook\":{\"attached_at_start\":1,\"contract_version\":%d,\"enabled_at_start\":%d,\"samples_out_prehook\":%ld},", a->hook2 ? 2 : 1, a->hookOnAtStart, a->wav[3].n);
+        else fprintf(f, "\"spec_hook\":{\"attached_at_start\":0,\"contract_version\":0},");
         fprintf(f, "\"events\":[");
         // pos = 开关生效的那一块输入在录音时间轴上的末尾（时间轴含被丢弃的段，与 dropped 的 pos 同一条）。
         // 这一块算出的帧当场参与输出合成、且覆盖最近 4 块，所以输出从 out_from = pos + latency − 4H 开始变化，到 out_full = pos + latency − H 起完全是新状态（Codex 复审 0.5.1）
@@ -259,9 +259,18 @@ int aec48_set_spec_hook(Aec48* a, aec48_spec_hook fn, void* user) {
     if (!a) return -1;
     if (a->inProc.load(std::memory_order_acquire) > 0) return -2;   // 正在 process：拒绝（尽力检测，约定上调用方保证不并发）
     std::lock_guard<std::mutex> lk(a->dmu); if (a->dumping.load()) return -3;   // 录音中不换挂钩：out_prehook 的有无在录音开始时定
-    if (fn && !a->hook && a->preDrain == 0) a->chain.accP = a->chain.acc;   // 已 ≥4 块没挂回调：两路的重叠相加状态本来就相等
-    if (!fn && a->hook) a->preDrain = 4;
-    a->hook = fn; a->hookUser = fn ? user : nullptr; return 0;
+    if (fn && !a->hook && !a->hook2 && a->preDrain == 0) a->chain.accP = a->chain.acc;   // 已 ≥4 块没挂回调：两路的重叠相加状态本来就相等
+    if (!fn && (a->hook || a->hook2)) a->preDrain = 4;
+    a->hook = fn; a->hook2 = nullptr; a->hookUser = fn ? user : nullptr; return 0;
+}
+
+int aec48_set_spec_hook2(Aec48* a, aec48_spec_hook2 fn, void* user) {
+    if (!a) return -1;
+    if (a->inProc.load(std::memory_order_acquire) > 0) return -2;
+    std::lock_guard<std::mutex> lk(a->dmu); if (a->dumping.load()) return -3;
+    if (fn) { a->chain.resetSide(); if (!a->hook && !a->hook2 && a->preDrain == 0) a->chain.accP = a->chain.acc; }
+    if (!fn && (a->hook || a->hook2)) a->preDrain = 4;
+    a->hook2 = fn; a->hook = nullptr; a->hookUser = fn ? user : nullptr; return 0;
 }
 
 void aec48_set_spec_hook_enabled(Aec48* a, int on) { if (a) a->hookOn.store(on ? 1 : 0, std::memory_order_relaxed); }   // 同 set_enabled：只写原子量
@@ -277,4 +286,39 @@ void aec48_destroy(Aec48* a) { if (!a) return; aec48_dump_stop(a); delete a; }
 
 // 仅供仓库自带的健壮性测试用（不在头文件里）：改下一次 dump_start 的录音队列容量（2 的幂），用来稳定复现"丢包超过上限"。
 __attribute__((visibility("default"))) void aec48_internal_set_dump_capacity(Aec48* a, unsigned long pow2) { if (a && pow2 >= 1024 && !(pow2 & (pow2 - 1))) a->dqCap = pow2; }
+#ifdef AEC48_TESTING
+// 仅供仓库内测试：返回最近一帧按掩码归一尺度估计的提示功率、换算后的未缩放功率与 g²。
+__attribute__((visibility("default"))) int aec48_internal_hook2_hint_values(Aec48* a, double* normalized, double* unscaled, double* g2) {
+    if (!a || !normalized || !unscaled || !g2 || a->chain.F <= 0) return 0;
+    *g2 = (double)(a->chain.sideLastG * a->chain.sideLastG);
+    for (int f = 0; f < a->chain.F; ++f) { normalized[f] = a->chain.sidePowerNorm[f]; unscaled[f] = a->chain.sideRhat[f]; }
+    return a->chain.F;
+}
+// 仅供仓库内默认版测试：核对递推器实际收到的带内功率与处理链本帧 g² 输入。
+__attribute__((visibility("default"))) int aec48_internal_hook2_scaled_inputs(Aec48* a) {
+    if (!a || a->chain.cnet.hint) return -1;
+    const auto& c = a->chain; if (c.sideHint.hNB > 48) return -1;
+    float pe[48] = {}, px[48] = {}; const float g2 = c.sideLastG * c.sideLastG;
+    for (int f = 0; f < c.F; ++f) { const int b = c.sideHint.hb[f]; pe[b] += (c.Er[f] * c.Er[f] + c.Ei[f] * c.Ei[f]) * g2; px[b] += (c.XAr[f] * c.XAr[f] + c.XAi[f] * c.XAi[f]) * g2; }
+    int n = 0; for (int b = 0; b < c.sideHint.hNB; ++b) { n += memcmp(&pe[b], &c.sideHint.hPe[b], sizeof(float)) != 0; n += memcmp(&px[b], &c.sideHint.hPx[b], sizeof(float)) != 0; }
+    return n;
+}
+// 仅供仓库内候选版测试：逐 float 位比较实际保存的归一提示功率与 Cofi hm²。
+__attribute__((visibility("default"))) int aec48_internal_hook2_hint_exact(Aec48* a) {
+    if (!a || !a->chain.cnet.hint) return -1;
+    int n = 0; for (int f = 0; f < a->chain.F; ++f) { const float p = a->chain.cnet.hm[f] * a->chain.cnet.hm[f]; n += memcmp(&a->chain.sidePowerNorm[f], &p, sizeof(float)) != 0; }
+    return n;
+}
+__attribute__((visibility("default"))) int aec48_internal_hook2_hint_error(Aec48* a, double out2[2]) {
+    if (!a || !out2 || !a->chain.cnet.hint) return 0;
+    double ma = 0, mp = 0;
+    const float g2f = a->chain.sideLastG * a->chain.sideLastG;
+    for (int f = 0; f < a->chain.F; ++f) {
+        const double p = (double)(a->chain.sideRhat[f] * g2f);
+        const double q = (double)a->chain.sidePowerNorm[f];
+        ma = std::max(ma, std::fabs(p - q)); mp = std::max(mp, std::max(p, q));
+    }
+    out2[0] = ma; out2[1] = mp > 0 ? ma / mp : 0; return 1;
+}
+#endif
 }

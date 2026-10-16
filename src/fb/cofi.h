@@ -5,6 +5,7 @@
 //   粗 / 细两路各多一个输入通道。逐帧同式于 Python cofi_np.Hint（= cofi_aec48.residual_echo_hint）：带功率 float 求和、递推 double。
 #pragma once
 #include "gtcrn.h"   // 复用 Ten、ftanh/sigm、pw、sfe、gruGates、gru1、layernorm
+#include "hint_v1.h"
 #ifdef COFI_Q8
 #include "q8.h"   // CPF 两个全连接用 int8（Arm KleidiAI 量化方式与内核）
 #endif
@@ -17,7 +18,7 @@ static inline bool gtcHasKey(const char* path, const char* key) {   // 不加载
     mf_.close(); return ok;
 }
 
-struct Cofi {
+struct Cofi : HintV1 {
     static const int FE = 129, F0 = 65, FL = 65;
     std::map<std::string, Ten> P; int F = 0; float floorDb = 20.f;
     double prof[10] = {0};
@@ -28,9 +29,6 @@ struct Cofi {
     struct IR { GRU g; const float *fw, *fb; std::vector<float> lw, lb; float le; int C, Fn; std::vector<float> h; };   // h: [C][Fn]
     MB mb_[8]; IR ir_[4]; GRU cg1, cg2; const float *f1w, *f1b, *f2w, *f2b, *clw, *clb; float cle; int H = 0, D = 0; std::vector<float> ch1, ch2;
     const float *erb = nullptr, *ierb = nullptr; std::vector<int> es, ee, is, ie;
-    // 残余回声提示（hint_v1）
-    bool hint = false; int hNB = 0, hK = 0; float hDec = 0, hUp = 0, hDn = 0; std::vector<int> hb; std::vector<float> hcnt, hdk, hPe, hPx, hPxs, hHist, hm, xm;
-    int hHead = 0, hFill = 0; double hPeak = 0; bool hSeen = false, hInit = false; std::vector<double> hNe, hL, hOut;
     std::vector<float> em, ym, rh, lm, xc0, xc9, xf7, xf21, h1, hd, yt, sk0, sk1, sk2, xf0, xa, xb, xc, xf, gi, gh, yi, z, z2, mF; std::vector<float> padr;   // 深度卷积补零缓冲
 
     const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "cofi: 缺参数 %s\n", k.c_str()); fb_fail(); } return it->second; }
@@ -43,11 +41,9 @@ struct Cofi {
         mf_.close(); T("arch_cofi"); F = nfft / 2 + 1; floorDb = floor_;
         hint = P.count("hint_v1") > 0;
         if (hint) { const Ten& hbT = T("hint_band"); const Ten& hp = T("hint_par"); if ((int)hbT.v.size() != F || hp.v.size() < 5) die("hint 参数形状不符");
-            hNB = (int)hp.v[0]; hK = (int)hp.v[1]; hDec = hp.v[2]; hUp = hp.v[3]; hDn = hp.v[4]; if (hNB <= 0 || hK < 1) die("hint 参数无效");
-            hb.resize(F); hcnt.assign(hNB, 0.f); for (int f = 0; f < F; ++f) { hb[f] = (int)hbT.v[f]; if (hb[f] < 0 || hb[f] >= hNB) die("hint 带号越界"); hcnt[hb[f]] += 1.f; }
-            for (auto& c : hcnt) c = std::max(c, 1.f);
-            hdk.assign(std::max(hK, 1), 1.f); for (int k = 1; k < hK; ++k) hdk[k] = (float)std::pow((double)hDec, (double)k);   // = Python 的 decay ** k（double 算再转 float）
-            hPe.assign(hNB, 0); hPx.assign(hNB, 0); hPxs.assign(hNB, 0); hHist.assign((size_t)std::max(hK - 1, 1) * hNB, 0); hNe.assign(hNB, 0); hL.assign(hNB, 0); hOut.assign(hNB, 0); hm.assign(F, 0); xm.assign(F, 0); }
+            const int nb = (int)hp.v[0], K = (int)hp.v[1]; if (nb <= 0 || K < 1) die("hint 参数无效");
+            std::vector<int> bands(F); for (int f = 0; f < F; ++f) { bands[f] = (int)hbT.v[f]; if (bands[f] < 0 || bands[f] >= nb) die("hint 带号越界"); }
+            init(F, nfft, 48000.0, nb, K, hp.v[2], hp.v[3], hp.v[4], bands.data()); }
         const int NC = hint ? 4 : 3, NFc = hint ? 8 : 7;   // 粗路输入通道（e、ŷ、ρ[、提示]）/ 细路（e×3、ŷ×3、ρ[、提示]）
         if (T("ce0.p1w").d[1] != 3 * NC || T("fe.p1w").d[1] != 3 * NFc) die(hint ? "提示版输入通道数不符" : "输入通道数不符（参数文件是否带提示却缺 hint_v1？）");
         if (T("erb_fc").d[1] != F - F0) { fprintf(stderr, "cofi: nfft %d 与参数不符（erb_fc %d 列）\n", nfft, T("erb_fc").d[1]); fb_fail(); }
@@ -82,26 +78,7 @@ struct Cofi {
         gi.assign(3 * mx, 0); gh.assign(3 * mx, 0); yi.assign(mx, 0); z.assign(std::max(H, D), 0); z2.assign(D, 0); padr.assign(2 * mx + 16, 0); mF.assign(F, 0);
     }
     void reset() { for (auto& m : mb_) { std::fill(m.cache.begin(), m.cache.end(), 0.f); std::fill(m.h.begin(), m.h.end(), 0.f); m.head = 0; } for (auto& r : ir_) std::fill(r.h.begin(), r.h.end(), 0.f); std::fill(ch1.begin(), ch1.end(), 0.f); std::fill(ch2.begin(), ch2.end(), 0.f);
-        if (hint) { hHead = hFill = 0; hPeak = 0; hSeen = hInit = false; std::fill(hNe.begin(), hNe.end(), 0.0); std::fill(hL.begin(), hL.end(), 0.0); } }
-
-    // 残余回声提示一帧：pe / px = 线性级残余 / 对齐参考的逐频点功率（em²、xm²）→ hm = sqrt(带内均摊的残余回声功率估计 + 1e-16)
-    void hintStep() {
-        std::fill(hPe.begin(), hPe.end(), 0.f); std::fill(hPx.begin(), hPx.end(), 0.f);
-        for (int f = 0; f < F; ++f) { hPe[hb[f]] += em[f] * em[f]; hPx[hb[f]] += xm[f] * xm[f]; }
-        float tot = 0; for (int b = 0; b < hNB; ++b) { hPxs[b] = hPx[b]; tot += hPx[b]; }
-        for (int k = 1; k <= hFill; ++k) { const float* q = &hHist[(size_t)((hHead - k + (hK - 1)) % (hK - 1)) * hNB]; const float d = hdk[k]; for (int b = 0; b < hNB; ++b) hPxs[b] = std::max(hPxs[b], q[b] * d); }   // 前 k 帧 × 衰减^k 的最大值
-        if (hK > 1) { memcpy(&hHist[(size_t)hHead * hNB], &hPx[0], hNB * 4); hHead = (hHead + 1) % (hK - 1); hFill = std::min(hFill + 1, hK - 1); }
-        hPeak = std::max(hPeak, (double)tot); const bool a = (double)tot > hPeak * 1e-5 + 1e-12;
-        if (!a) { for (int b = 0; b < hNB; ++b) hNe[b] = hSeen ? std::min(hNe[b] * 1.001, (double)hPe[b]) : (double)hPe[b]; hSeen = true; }
-        for (int b = 0; b < hNB; ++b) {
-            const double p = hPe[b], sx = hPxs[b], lr = 10.0 * std::log10(std::max(p - hNe[b], 1e-14) / (sx + 1e-14)), l = hL[b];
-            double nl = lr < l ? l + hDn * (lr - l) : std::min(lr, l + (double)hUp); if (!hInit) nl = lr;
-            if (a) hL[b] = nl;
-            hOut[b] = 0; }
-        if (a) hInit = true;
-        if (a && hInit) for (int b = 0; b < hNB; ++b) hOut[b] = std::pow(10.0, hL[b] / 10.0) * (double)hPxs[b];
-        for (int f = 0; f < F; ++f) hm[f] = std::sqrt((float)hOut[hb[f]] / hcnt[hb[f]] + 1e-16f);
-    }
+        if (hint) resetHint(); }
 
     // AffinePReLU：y = aw·x + ab + (x>0 ? x : s_c·x)，x [C][N] 原地
     static void aprelu(float* x, int C, int N, const float* aw, const float* ab, const float* s) {
@@ -179,7 +156,7 @@ struct Cofi {
         const float LG = 0.4342944819f;   // 1/ln10
         for (int f = 0; f < F; ++f) { const float er = se[2 * f], ei = se[2 * f + 1], yr = sy[2 * f], yi_ = sy[2 * f + 1]; const float pe = er * er + ei * ei + 1e-12f, py = yr * yr + yi_ * yi_ + 1e-12f;
             em[f] = std::sqrt(pe); ym[f] = std::sqrt(py); rh[f] = pe / (pe + py + 1e-9f); }
-        if (hint) { if (!sx) die("提示版需要对齐参考谱 sx"); for (int f = 0; f < F; ++f) xm[f] = std::sqrt(sx[2 * f] * sx[2 * f] + sx[2 * f + 1] * sx[2 * f + 1] + 1e-12f); hintStep(); }
+        if (hint) { if (!sx) die("提示版需要对齐参考谱 sx"); for (int f = 0; f < F; ++f) xm[f] = std::sqrt(sx[2 * f] * sx[2 * f] + sx[2 * f + 1] * sx[2 * f + 1] + 1e-12f); HintV1::hintStep(F, em.data(), xm.data()); }
         const int NC = hint ? 4 : 3, NFc = hint ? 8 : 7;
         const int Fh = F - F0; const float* src[4] = {&em[0], &ym[0], &rh[0], hm.data()};   // 默认版 hm 为空（NC = 3 不读第四路），不能写 &hm[0]
         for (int c = 0; c < NC; ++c) { const float* xs = src[c]; float* yc = &xc0[c * FE]; memcpy(yc, xs, F0 * 4); for (int r = 0; r < 64; ++r) { float a = 0; const float* wr = erb + r * Fh; for (int k = es[r]; k < ee[r]; ++k) a += wr[k] * xs[F0 + k]; yc[F0 + r] = a; } }
