@@ -22,7 +22,7 @@ SING, TALK = 0, 1
 BLOCKS = 80
 
 
-def bind(path, profile_api=True):
+def bind(path, profile_api=True, talk_highpass_off=False):
     lib = C.CDLL(str(Path(path).resolve()))
     lib.aec48_create.argtypes = [C.c_int, C.c_int]
     lib.aec48_create.restype = C.c_void_p
@@ -41,6 +41,10 @@ def bind(path, profile_api=True):
     lib.aec48_process_s16.restype = C.c_int
     lib.aec48_latency_samples.argtypes = [C.c_void_p]
     lib.aec48_latency_samples.restype = C.c_int
+    lib.talk_highpass_off = talk_highpass_off
+    if talk_highpass_off:
+        lib.aec48_set_talk_highpass.argtypes = [C.c_void_p, C.c_int]
+        lib.aec48_set_talk_highpass.restype = C.c_int
     return lib
 
 
@@ -64,6 +68,8 @@ def run_fixed(lib, profile, sr, block, mic, ref, integer):
     if not a:
         raise RuntimeError(f"create failed ({sr}, {block})")
     try:
+        if lib.talk_highpass_off:
+            assert lib.aec48_set_talk_highpass(a, 0) == 0
         if profile is not None:
             rc = lib.aec48_set_profile(a, profile)
             if rc != 0:
@@ -178,6 +184,8 @@ def run_sequence(lib, mode, mic, ref, sr, block, start_profile, gate_on=True):
     if not a:
         raise RuntimeError("sequence create failed")
     try:
+        if lib.talk_highpass_off:
+            assert lib.aec48_set_talk_highpass(a, 0) == 0
         if lib.aec48_set_profile(a, start_profile) != 0:
             raise AssertionError("initial profile rejected")
         if lib.aec48_set_talk_gate(a, int(gate_on), -3.0) != 0:
@@ -272,13 +280,15 @@ def main():
     p.add_argument("--dual", required=True)
     p.add_argument("--baseline-dir", required=True)
     p.add_argument("--out-dir", required=True)
+    p.add_argument("--talk-highpass-off", action="store_true",
+                   help="disable the 0.10 talk high-pass for comparison to 0.9 releases")
     p.add_argument("--seed", type=int, default=202610170041,
                    help="final blind random-set seed start; keep separate from single-case tuning")
     p.add_argument("--random-cases", type=int, default=48)
     args = p.parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    lib = bind(args.dual)
+    lib = bind(args.dual, talk_highpass_off=args.talk_highpass_off)
     byte_result = byte_regression(lib, args.baseline_dir, out_dir)
     blind_result = independent_regression(lib, args.baseline_dir, out_dir, args.seed, args.random_cases)
     switch_result = switch_check(lib, out_dir)

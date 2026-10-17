@@ -80,6 +80,7 @@ struct Aec48 {
     ac::Chain chain; int sr = 48000, H = 384, prefill = 0, lat = 0;
     std::vector<float> inM, inR, blkO, blkP; int fill = 0; Ring outQ, outP;   // outP：回调前的输出，与 outQ 同步推、同步取
     std::atomic<int> enabled{1};
+    std::atomic<int> talkHighpassOn{1};
     std::atomic<int> requestedProfile{AEC48_PROFILE_TALK}, activeProfile{AEC48_PROFILE_TALK};
     std::atomic<int> talkGateOn{1}; std::atomic<uint32_t> talkThresholdBits{0};
     std::vector<float> tmpO, tmpP;   // 取输出的中转（H 个，create 时分配）
@@ -115,7 +116,8 @@ static void block(Aec48* a, const float* m, const float* r, long evPos) {
     const int profile = a->activeProfile.load(std::memory_order_relaxed);
 #endif
     a->chain.push(m, r, a->blkO.data(), en ? 2 : 0, a->hook, a->hookUser, ho != 0, pre ? a->blkP.data() : nullptr, a->hook2, a->hookUser,
-                  a->talkGateOn.load(std::memory_order_relaxed) != 0, threshold, profile);
+                  a->talkGateOn.load(std::memory_order_relaxed) != 0, threshold, profile,
+                  a->talkHighpassOn.load(std::memory_order_relaxed) != 0);
     if (!pre) memcpy(a->blkP.data(), a->blkO.data(), a->H * 4);
     a->outQ.push(a->blkO.data(), a->H);   // outQ 最多积压 prefill + H，远小于容量
     a->outP.push(a->blkP.data(), a->H);
@@ -177,7 +179,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.9.0 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.10.0 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -232,6 +234,12 @@ int aec48_set_talk_gate(Aec48* a, int on, float threshold_logit) {
     if (!a || !a->chain.cnet.hasTalkHead || (bits & 0x7f800000u) == 0x7f800000u) return -1;
     a->talkThresholdBits.store(bits, std::memory_order_relaxed);
     a->talkGateOn.store(on ? 1 : 0, std::memory_order_relaxed);
+    return 0;
+}
+
+int aec48_set_talk_highpass(Aec48* a, int on) {
+    if (!a || !a->chain.cnet.hasTalkHead) return -1;
+    a->talkHighpassOn.store(on ? 1 : 0, std::memory_order_relaxed);
     return 0;
 }
 

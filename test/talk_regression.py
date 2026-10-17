@@ -10,12 +10,17 @@ p = argparse.ArgumentParser()
 p.add_argument('library')
 p.add_argument('output')
 p.add_argument('--compare')
+p.add_argument('--talk-highpass-off', action='store_true',
+               help='disable the 0.10 talk high-pass before processing for 0.9 byte comparisons')
 a = p.parse_args()
 lib = C.CDLL(str(Path(a.library).resolve()))
 lib.aec48_create.argtypes = [C.c_int, C.c_int]
 lib.aec48_create.restype = C.c_void_p
 lib.aec48_destroy.argtypes = [C.c_void_p]
 lib.aec48_set_enabled.argtypes = [C.c_void_p, C.c_int]
+if a.talk_highpass_off:
+    lib.aec48_set_talk_highpass.argtypes = [C.c_void_p, C.c_int]
+    lib.aec48_set_talk_highpass.restype = C.c_int
 for name, dtype in [('aec48_process', C.c_float), ('aec48_process_s16', C.c_int16)]:
     getattr(lib, name).argtypes = [C.c_void_p] + [C.POINTER(dtype)] * 3 + [C.c_int]
 out = {}
@@ -34,6 +39,8 @@ for i in range(12):
         y = np.zeros_like(m)
         h = lib.aec48_create(sr, block)
         assert h
+        if a.talk_highpass_off:
+            assert lib.aec48_set_talk_highpass(h, 0) == 0
         for j in range(80):
             if j in (30, 45): lib.aec48_set_enabled(h, int(j == 45))
             sl = slice(j * block, (j + 1) * block)

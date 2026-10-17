@@ -60,6 +60,8 @@ p = argparse.ArgumentParser()
 p.add_argument('--build', default='build-host-talk-test')
 p.add_argument('--output', default='build-talk-evidence')
 p.add_argument('--mode', choices=['gate','chain','snapshot'], required=True)
+p.add_argument('--talk-highpass-off', action='store_true',
+               help='compare the original pre-high-pass Python chain to 0.10 with HPF disabled')
 a = p.parse_args()
 od = ROOT/a.output
 od.mkdir(exist_ok=True, parents=True)
@@ -101,6 +103,10 @@ elif a.mode == 'snapshot':
     outputs=[]; zs=[]; ls=[]; spectra=[]
     for enabled in (True,False):
         h=lib.aec48_create(48000,384); assert h
+        if a.talk_highpass_off:
+            lib.aec48_set_talk_highpass.argtypes=[C.c_void_p,C.c_int]
+            lib.aec48_set_talk_highpass.restype=C.c_int
+            assert lib.aec48_set_talk_highpass(h,0)==0
         assert lib.aec48_set_talk_gate(h,int(enabled),TH)==0
         y=np.zeros(n,np.float32)
         buffers=[np.zeros(829,np.float32),np.zeros(1,np.float32)]+[np.zeros(1538,np.float32) for _ in range(5)]
@@ -185,6 +191,10 @@ elif a.mode == 'chain':
         lib.aec48_destroy.argtypes=[C.c_void_p]
         lib.aec48_set_talk_gate.argtypes=[C.c_void_p,C.c_int,C.c_float]; lib.aec48_set_talk_gate.restype=C.c_int
         h=lib.aec48_create(48000,384); assert h
+        if a.talk_highpass_off:
+            lib.aec48_set_talk_highpass.argtypes=[C.c_void_p,C.c_int]
+            lib.aec48_set_talk_highpass.restype=C.c_int
+            assert lib.aec48_set_talk_highpass(h,0)==0
         assert lib.aec48_set_talk_gate(h,1,TH)==0   # 0.8.1 复审：C 侧门限与 Python 参照一致
         y=np.zeros(n+1536,np.float32)
         mm=np.pad(m,(0,1536)); rr=np.pad(r,(0,1536))

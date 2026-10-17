@@ -25,6 +25,9 @@
 static std::vector<short> rd(const char* p) { FILE* f = fopen(p, "rb"); if (!f) { perror(p); exit(2); } fseek(f, 0, SEEK_END); long n = ftell(f) / 2; fseek(f, 0, SEEK_SET); std::vector<short> v(n); if (fread(v.data(), 2, n, f) != (size_t)n) exit(2); fclose(f); return v; }
 static int fails = 0;
 static void ck(bool ok, const char* name, const char* fmt, double v) { printf("%s %-46s ", ok ? "通过  " : "不通过", name); printf(fmt, v); printf("\n"); if (!ok) ++fails; }
+// These legacy assertions require the pre-existing three-block OLA streams to
+// become bit-identical immediately; keep HPF off so they test OLA semantics alone.
+static Aec48* make_instance(int sr, int fpc) { Aec48* a = aec48_create(sr, fpc); if (a) aec48_set_talk_highpass(a, 0); return a; }
 
 struct Rec { long calls = 0; int badBins = 0; float scale = 1.f; bool zero = false; };
 static void hookFn(void* u, float* re, float* im, int bins) {
@@ -40,7 +43,7 @@ static bool exists(const std::string& p) { FILE* f = fopen(p.c_str(), "rb"); if 
 static void capFn(void* u, float* re, float* im, int bins) { Cap* c = (Cap*)u; if ((long)c->re.size() < c->maxFrames) { c->re.emplace_back(re, re + bins); c->im.emplace_back(im, im + bins); } }
 
 static std::vector<float> run(int sr, const std::vector<float>& mic, const std::vector<float>& ref, aec48_spec_hook fn, void* u, int enabled = 1, long hookOnAt = -1) {
-    Aec48* a = aec48_create(sr, 384); if (!a) { printf("创建失败\n"); exit(1); }
+    Aec48* a = make_instance(sr, 384); if (!a) { printf("创建失败\n"); exit(1); }
     aec48_set_enabled(a, enabled);
     if (fn) { aec48_set_spec_hook(a, fn, u); if (hookOnAt >= 0) aec48_set_spec_hook_enabled(a, 0); }
     std::vector<float> out(mic.size(), 0.f); const long n = (long)mic.size();
@@ -54,7 +57,7 @@ int main(int argc, char** argv) {
     if (argc > 4 && !strcmp(argv[4], "bench")) {
         const long L = 30L * sr / 384 * 384; std::vector<float> bm(L), br(L), bo(L); for (long i = 0; i < L; ++i) { bm[i] = m16[i % m16.size()] / 32768.f; br[i] = r16[i % r16.size()] / 32768.f; }
         double t[2] = {0, 0}; Rec r;
-        for (int round = 0; round < 6; ++round) { const int h = round & 1; Aec48* a = aec48_create(sr, 384); if (h) aec48_set_spec_hook(a, hookFn, &r);
+        for (int round = 0; round < 6; ++round) { const int h = round & 1; Aec48* a = make_instance(sr, 384); if (h) aec48_set_spec_hook(a, hookFn, &r);
             auto t0 = std::chrono::steady_clock::now(); for (long i = 0; i < L; i += 384) aec48_process(a, &bm[i], &br[i], &bo[i], 384);
             t[h] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / (L / 384); aec48_destroy(a); }
         printf("%s · 每块平均：不挂 %.3f ms，挂恒等回调 %.3f ms（多 %.3f ms，%+.1f%%）\n", aec48_version(), t[0] / 3, t[1] / 3, (t[1] - t[0]) / 3, 100 * (t[1] - t[0]) / t[0]);
@@ -63,7 +66,7 @@ int main(int argc, char** argv) {
     std::vector<float> mic(n), ref(n); for (long i = 0; i < n; ++i) { mic[i] = m16[i] / 32768.f; ref[i] = r16[i] / 32768.f; }
     const long blocks = n / 384; printf("%s · 采样率 %d · %ld 块\n", aec48_version(), sr, blocks);
 
-    { Aec48* a = aec48_create(sr, 384); int s = 0, N = 0, H = 0, w = 0; aec48_spec_format(a, &s, &N, &H, &w);
+    { Aec48* a = make_instance(sr, 384); int s = 0, N = 0, H = 0, w = 0; aec48_spec_format(a, &s, &N, &H, &w);
       ck(s == sr && N == 1536 && H == 384 && w == AEC48_WINDOW_SQRT_HANN_PERIODIC, "H-1 格式查询", "(nfft %.0f)", N);
       ck(aec48_set_spec_hook(nullptr, hookFn, nullptr) == -1, "H-6 参数无效返回 -1", "%.0f", 0);
       aec48_destroy(a); }
@@ -98,7 +101,7 @@ int main(int argc, char** argv) {
         ck(e <= 1e-6, "H-5 中途打开后 = 一直开着", "(最大差 %.2e)", e); }
 
     if (argc > 4) {   // H-6 / H-7：录音
-        const std::string d = argv[4]; Aec48* a = aec48_create(sr, 384); Rec r; r.scale = 0.5f;
+        const std::string d = argv[4]; Aec48* a = make_instance(sr, 384); Rec r; r.scale = 0.5f;
         aec48_set_spec_hook(a, hookFn, &r);
         int rc0 = aec48_dump_start(a, d.c_str()); int rcHook = aec48_set_spec_hook(a, nullptr, nullptr);
         ck(rc0 == 0 && rcHook == -3, "H-6 录音中摘挂钩返回 -3", "(%.0f)", rcHook);
@@ -114,7 +117,7 @@ int main(int argc, char** argv) {
         ck(meta.find("\"spec_hook\":{\"attached_at_start\":1") != std::string::npos, "H-7 meta.json 记了 spec_hook", "%.0f", 0);
 
         if (blocks < 60) printf("跳过   H-8 输入只有 %ld 块（要 ≥ 60）\n", blocks); else {   // H-8：回调在第 f 帧关回调、第 g 帧关回声消除（都是下一块生效）；每次 process 送 10 块，事件仍要落在块上
-            const long f = 37, g = 29; Aec48* b = aec48_create(sr, 3840); Tog t; t.a = b; t.offHookAt = f; t.offAecAt = g;
+            const long f = 37, g = 29; Aec48* b = make_instance(sr, 3840); Tog t; t.a = b; t.offHookAt = f; t.offAecAt = g;
             aec48_set_spec_hook(b, togFn, &t); aec48_dump_start(b, d.c_str());
             std::vector<float> o2(n, 0.f); for (long i = 0; i + 3840 <= n; i += 3840) aec48_process(b, &mic[i], &ref[i], &o2[i], 3840);
             aec48_dump_stop(b); aec48_destroy(b); std::string m = slurp(d + "/meta.json");
@@ -122,12 +125,12 @@ int main(int argc, char** argv) {
             ck(m.find(e1) != std::string::npos && m.find(e2) != std::string::npos && m.find("\"events_overflow\":0") != std::string::npos, "H-8 开关事件落在生效那一块的末尾", "(回调开关 pos %.0f)", (double)(f + 3) * 384);
             if (m.find(e1) == std::string::npos) printf("    meta：%s\n", m.c_str()); }
         {   // H-9：同一目录先挂回调录（上面 H-8 刚录过，有 out_prehook.wav），再不挂回调录
-            bool had = exists(d + "/out_prehook.wav"); Aec48* b = aec48_create(sr, 384); aec48_dump_start(b, d.c_str());
+            bool had = exists(d + "/out_prehook.wav"); Aec48* b = make_instance(sr, 384); aec48_dump_start(b, d.c_str());
             std::vector<float> o2(n, 0.f); for (long i = 0; i + 384 <= n; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
             aec48_dump_stop(b); aec48_destroy(b);
             ck(had && !exists(d + "/out_prehook.wav"), "H-9 不挂回调再录：旧 out_prehook.wav 已删", "%.0f", 0); }
         {   // H-10：先挂置零回调处理一半 → 摘掉 → 马上挂回 ×1 回调 → 录后一半：out_prehook 应 = 一直不挂时的输出
-            Aec48* b = aec48_create(sr, 384); Rec z; z.zero = true; Rec one; aec48_set_spec_hook(b, hookFn, &z);
+            Aec48* b = make_instance(sr, 384); Rec z; z.zero = true; Rec one; aec48_set_spec_hook(b, hookFn, &z);
             const long half = (blocks / 2) * 384; std::vector<float> o2(n, 0.f);
             for (long i = 0; i < half; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
             aec48_set_spec_hook(b, nullptr, nullptr); aec48_set_spec_hook(b, hookFn, &one); aec48_dump_start(b, d.c_str());
@@ -138,13 +141,13 @@ int main(int argc, char** argv) {
             ck((long)pw.size() - 22 == n - half && e <= 1, "H-10 摘掉再挂上后录音：out_prehook = 回调前", "(最大差 %.0f LSB)", e); }
         for (int fpc : {384, 0}) {   // H-12（切换帧按输入长度取，过渡区要整个落在输入里；不够就跳过——Codex 复审 0.5.2）
             const long f = std::min(40L, blocks / 3);
-            if (blocks < 30) { printf("跳过   H-12 输入只有 %ld 块（要 ≥ 30）\n", blocks); break; } Aec48* b = aec48_create(sr, fpc); Rec z; z.zero = true;
+            if (blocks < 30) { printf("跳过   H-12 输入只有 %ld 块（要 ≥ 30）\n", blocks); break; } Aec48* b = make_instance(sr, fpc); Rec z; z.zero = true;
             struct ZT { Aec48* a; Rec* z; long fr = 0, offAt; } zt{b, &z, 0, f};
             aec48_set_spec_hook(b, [](void* u, float* re, float* im, int bins) { ZT* t = (ZT*)u; if (t->fr++ == t->offAt) aec48_set_spec_hook_enabled(t->a, 0); hookFn(t->z, re, im, bins); }, &zt);
             aec48_dump_start(b, d.c_str()); std::vector<float> o2(n, 0.f);
             for (long i = 0; i + 384 <= n; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
             aec48_dump_stop(b); const int lat = aec48_latency_samples(b); aec48_destroy(b);
-            Aec48* c = aec48_create(sr, fpc); std::vector<float> bo(n, 0.f); for (long i = 0; i + 384 <= n; i += 384) aec48_process(c, &mic[i], &ref[i], &bo[i], 384); aec48_destroy(c);
+            Aec48* c = make_instance(sr, fpc); std::vector<float> bo(n, 0.f); for (long i = 0; i + 384 <= n; i += 384) aec48_process(c, &mic[i], &ref[i], &bo[i], 384); aec48_destroy(c);
             const long pos = (f + 3) * 384, from = pos + lat - 1536, full = pos + lat - 384;
             std::string m = slurp(d + "/meta.json"); char e[160]; snprintf(e, sizeof e, "{\"pos\":%ld,\"spec_hook_enabled\":0,\"out_from\":%ld,\"out_full\":%ld}", pos, from, full);
             bool zeroBefore = true, moved = false, same = true; for (long i = 0; i < from; ++i) zeroBefore = zeroBefore && o2[i] == 0.f;
@@ -154,7 +157,7 @@ int main(int argc, char** argv) {
             ck(m.find(e) != std::string::npos && zeroBefore && moved && same && !sameEarly, nm, "(out_from %.0f)", (double)from);
             if (m.find(e) == std::string::npos) printf("    期望 %s\n    meta %s\n", e, m.c_str()); }
         {   // H-11：置零回调处理一段 → 摘掉 → 不挂处理 10 块（> 4 块，走「两路本来相等、直接拷」那条路）→ 挂回 ×1 回调 → 录：out_prehook = 回调前
-            Aec48* b = aec48_create(sr, 384); Rec z; z.zero = true; Rec one; aec48_set_spec_hook(b, hookFn, &z);
+            Aec48* b = make_instance(sr, 384); Rec z; z.zero = true; Rec one; aec48_set_spec_hook(b, hookFn, &z);
             const long q1 = (blocks / 4) * 384, q2 = q1 + 10 * 384; std::vector<float> o2(n, 0.f);
             for (long i = 0; i < q1; i += 384) aec48_process(b, &mic[i], &ref[i], &o2[i], 384);
             aec48_set_spec_hook(b, nullptr, nullptr);

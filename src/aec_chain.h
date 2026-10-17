@@ -11,6 +11,7 @@
 #include "fb/cofi.h"
 #include "aec48.h"
 #include "talk_gate.h"
+#include "fb/talk_hpf.h"
 #include "pffft.h"
 #include <vector>
 #include <complex>
@@ -45,6 +46,12 @@ struct Chain {
     bool singOLAActive = false, talkOLAActive = false;
     long long talkFrames = 0;
 #endif
+    fb::TalkHighpass talkHpf;
+    fb::TalkHighpass preTalkHpf;
+    std::vector<float> hpfScratch, preHpfScratch, hpfWeights;
+    float hpfMix = 1.f, hpfFrom = 1.f;
+    int hpfTarget = 1, hpfFadeAt = 0;
+    bool hpfStarted = false;
     TalkGate talkGate;
     bool talkFrameReady = false;
     int N = 0, H = 0, F = 0; RFft rf;
@@ -80,6 +87,10 @@ struct Chain {
         sideResid.assign(F, 0.f); sideRhat.assign(F, 0.f); sidePowerNorm.assign(F, 0.f); sideEr.assign(F, 0.f); sideXr.assign(F, 0.f);
         farWinN = (int)std::ceil(sr / H); farWin.assign(farWinN, 0); farWinAt = farWinCount = 0; farPeak = 0;
         if (cnet.hasTalkHead) talkGate.init(H, (int)sampleRate);
+        if (cnet.hasTalkHead) {
+            if (!talkHpf.init(sampleRate) || !preTalkHpf.init(sampleRate)) return false;
+            hpfScratch.assign(H, 0.f); preHpfScratch.assign(H, 0.f); hpfWeights.assign(H, 0.f);
+        }
         win.resize(N); for (int i = 0; i < N; ++i) win[i] = std::sqrt(0.5f * (1.f - std::cos(2.f * (float)M_PI * i / N)));
         mh.assign(N, 0.f); rh.assign(N, 0.f); xw.resize(N); dw.resize(N); Xr.resize(F); Xi.resize(F); Dr.resize(F); Di.resize(F); Er.resize(F); Ei.resize(F);
         se.resize(2 * F); sy.resize(2 * F); mo.resize(2 * F); FX.resize(N); acc.assign(N, 0.f); wacc.assign(N, 0.f);
@@ -107,12 +118,26 @@ struct Chain {
 #ifdef AEC48_DUAL
         accPSing = accSing;
 #endif
+        preTalkHpf = talkHpf;
     }
 
     // mic / ref：本块 H 个样本（±1 满幅）；out：H 个样本（= 4 块之前那块的处理结果）。
     // hook 非空时每帧调一次（hookOn = false 时跳过）；pre 非空时同时写出「回调前」的 H 个样本（与 out 同一时间轴）。
-    void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr, aec48_spec_hook2 hook2 = nullptr, void* user2 = nullptr, bool gateOn = true, float gateThreshold = -3.0f, int profile = AEC48_PROFILE_TALK) {
+    void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr, aec48_spec_hook2 hook2 = nullptr, void* user2 = nullptr, bool gateOn = true, float gateThreshold = -3.0f, int profile = AEC48_PROFILE_TALK, bool talkHpfOn = true) {
         talkFrameReady = false;
+        if (cnet.hasTalkHead) {
+            const int requested = talkHpfOn ? 1 : 0;
+            if (!hpfStarted) {
+                hpfStarted = true;
+                hpfTarget = requested;
+                hpfMix = hpfFrom = static_cast<float>(requested);
+                hpfFadeAt = 0;
+            } else if (requested != hpfTarget) {
+                hpfTarget = requested;
+                hpfFrom = hpfMix;
+                hpfFadeAt = 0;
+            }
+        }
 #ifdef AEC48_DUAL
         float blendStart = talkBlend;
         if (k == 0) talkBlend = blendStart = profile == AEC48_PROFILE_TALK ? 1.f : 0.f;
@@ -316,6 +341,34 @@ struct Chain {
             talkGate.apply(outTalk.data(), talkFrames - 1, mode);
             if (pre) talkGate.apply(preTalk.data(), talkFrames - 1, mode);
         }
+        // Filter the talk lane before the profile crossfade. When the talk
+        // lane sleeps in dual mode, feed the live singing lane through the
+        // filter state so a later talk transition starts with current state.
+        if (cnet.hasTalkHead) {
+            const float* hpfInput = runTalk ? outTalk.data() : outSing.data();
+            talkHpf.process(hpfInput, hpfScratch.data(), H);
+            const float* preInput = runTalk ? preTalk.data() : preSing.data();
+            if (pre) preTalkHpf.process(preInput, preHpfScratch.data(), H);
+            float* talkLane = runTalk ? outTalk.data() : nullptr;
+            float* preLane = pre && runTalk ? preTalk.data() : nullptr;
+            for (int q = 0; q < H; ++q) {
+                float w = hpfMix;
+                if (hpfFadeAt < 4 * H) {
+                    ++hpfFadeAt;
+                    w = hpfFrom + (static_cast<float>(hpfTarget) - hpfFrom) * (static_cast<float>(hpfFadeAt) / (4.f * H));
+                    hpfMix = w;
+                } else hpfMix = w = static_cast<float>(hpfTarget);
+                hpfWeights[q] = w;
+                if (talkLane) {
+                    const float dry = talkLane[q], wet = hpfScratch[q];
+                    if (mode != 0 && w > 0.f) talkLane[q] = w >= 1.f ? wet : (1.f - w) * dry + w * wet;
+                }
+                if (preLane && mode != 0 && w > 0.f) {
+                    const float dry = preLane[q], wet = preHpfScratch[q];
+                    preLane[q] = w >= 1.f ? wet : (1.f - w) * dry + w * wet;
+                }
+            }
+        }
         if (crossing && mode == 0) { memcpy(out, outTalk.data(), H * sizeof(float)); if (pre) memcpy(pre, preTalk.data(), H * sizeof(float)); }
         else if (crossing) for (int q = 0; q < H; ++q) {
             const float w = blendStart + (talkBlend - blendStart) * ((q + 1.f) / H);
@@ -334,8 +387,30 @@ struct Chain {
         if (pre && !anyHook) for (int q = 0; q < N; ++q) accP[q] += xw[q] * win[q];       // 回调没调：回调前 = 回调后
         for (int q = 0; q < H; ++q) out[q] = wacc[q] > 1e-8f ? acc[q] / wacc[q] : 0.f;
         if (cnet.hasTalkHead && gateOn) talkGate.apply(out, k - 2, mode);
+        if (cnet.hasTalkHead) {
+            talkHpf.process(out, hpfScratch.data(), H);
+            for (int q = 0; q < H; ++q) {
+                float w = hpfMix;
+                if (hpfFadeAt < 4 * H) {
+                    ++hpfFadeAt;
+                    w = hpfFrom + (static_cast<float>(hpfTarget) - hpfFrom) * (static_cast<float>(hpfFadeAt) / (4.f * H));
+                    hpfMix = w;
+                } else hpfMix = w = static_cast<float>(hpfTarget);
+                hpfWeights[q] = w;
+                if (mode != 0 && w >= 1.f) out[q] = hpfScratch[q];
+                else if (mode != 0 && w > 0.f) out[q] = (1.f - w) * out[q] + w * hpfScratch[q];
+            }
+        }
         if (pre) for (int q = 0; q < H; ++q) pre[q] = wacc[q] > 1e-8f ? accP[q] / wacc[q] : 0.f;
         if (cnet.hasTalkHead && gateOn && pre) talkGate.apply(pre, k - 2, mode);
+        if (cnet.hasTalkHead && pre) {
+            preTalkHpf.process(pre, preHpfScratch.data(), H);
+            for (int q = 0; q < H; ++q) {
+                const float w = hpfWeights[q];
+                if (mode != 0 && w >= 1.f) pre[q] = preHpfScratch[q];
+                else if (mode != 0 && w > 0.f) pre[q] = (1.f - w) * pre[q] + w * preHpfScratch[q];
+            }
+        }
         memmove(acc.data(), acc.data() + H, (N - H) * 4); memset(acc.data() + N - H, 0, H * 4);
         if (pre) { memmove(accP.data(), accP.data() + H, (N - H) * 4); memset(accP.data() + N - H, 0, H * 4); }
 #endif

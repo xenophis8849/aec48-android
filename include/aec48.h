@@ -1,5 +1,5 @@
 /*
- * aec48 0.9.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.10.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -7,7 +7,7 @@
  *   aec48_destroy(a);
  *
  * 线程：一个实例的 process 只能在同一个线程里调（不加锁、不分配内存、不做文件读写，可以放在音频回调里）；
- *       aec48_set_enabled / aec48_set_profile / aec48_set_spec_hook_enabled 只写原子量（不加锁、不分配），可以在任意线程调，包括音频线程；aec48_dump_* 可以在任意线程调（会加锁，不要在音频线程里调）。
+ *       aec48_set_enabled / aec48_set_profile / aec48_set_spec_hook_enabled / aec48_set_talk_highpass 只写原子量（不加锁、不分配），可以在任意线程调，包括音频线程；aec48_dump_* 可以在任意线程调（会加锁，不要在音频线程里调）。
  * 数据：float，满幅 ±1.0，单声道。mic 与 ref 必须是同一个采样率、同样多的样本。
  * 延迟：out 比 mic 晚 aec48_latency_samples() 个样本（48k、块长为 384 的整数倍时 1152 = 24 ms；其他块长 1536 = 32 ms）。
  */
@@ -25,7 +25,7 @@ extern "C" {
 
 typedef struct Aec48 Aec48;
 
-/* 0.9.0 双档构建的处理档位。单档构建只接受与自身匹配的值。 */
+/* 0.10.0 双档构建的处理档位。单档构建只接受与自身匹配的值。 */
 typedef enum Aec48Profile {
     AEC48_PROFILE_SING = 0,
     AEC48_PROFILE_TALK = 1
@@ -58,6 +58,12 @@ AEC48_EXPORT void aec48_set_enabled(Aec48* a, int on);
  * dual 的唱歌档不施门，但门设置保留到下次讲话档。可在任意线程调用，包括音频线程；只写原子量、不加锁、不分配。
  * 讲话版及 dual 版返回 0；其他单档版或空实例返回 -1。 */
 AEC48_EXPORT int aec48_set_talk_gate(Aec48* a, int on, float threshold_logit);
+
+/* 讲话档输出的 80 Hz、4 阶 Butterworth 高通（按实际采样率设计），默认开启。
+ * 仅讲话版及 dual 版可用，其他版本或空实例返回 -1。只写原子量，下一处理块生效。
+ * 开关在 4 块内逐样本淡化；滤波状态持续更新。dual 的唱歌档不滤，讲话支路在切档淡化中已滤。
+ * aec48_set_enabled(a, 0) 直通时不滤波。频谱回调仍接收高通前的频谱。 */
+AEC48_EXPORT int aec48_set_talk_highpass(Aec48* a, int on);
 
 /* out 相对 mic 的固定延迟（样本数）。 */
 AEC48_EXPORT int aec48_latency_samples(const Aec48* a);
@@ -126,7 +132,7 @@ AEC48_EXPORT void aec48_set_spec_hook_enabled(Aec48* a, int on);
 /* 查询帧格式：采样率、窗长、帧移、窗型编号。串接方据此核对自己的格式，对不上就不要挂。 */
 AEC48_EXPORT void aec48_spec_format(const Aec48* a, int* sample_rate, int* nfft, int* hop, int* window_id);
 
-/* 版本与模型标识，例如 "aec48 0.1 (lin nlinBc3-dual, mask v59ae20)"。 */
+/* 版本与模型标识，例如 "aec48 0.10.0 (lin nlinBc3-dual, mask v59ae20)"。 */
 AEC48_EXPORT const char* aec48_version(void);
 
 #ifdef __cplusplus

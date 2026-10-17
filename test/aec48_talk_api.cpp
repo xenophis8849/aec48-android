@@ -8,6 +8,7 @@ static std::vector<float> run(bool bypass, bool gate, float threshold) {
     Aec48* a = aec48_create(48000, 384);
     if (!a) return {};
     aec48_set_enabled(a, !bypass);
+    aec48_set_talk_highpass(a, 0); // isolate the pre-existing talk-gate parity check from the new post-gate HPF
     aec48_set_talk_gate(a, gate, threshold);
     std::vector<float> y(384*350), m(384), r(384);
     for (int b=0;b<350;++b) {
@@ -20,6 +21,7 @@ int main() {
     Aec48* a=aec48_create(48000,384); if (!a) return 1;
     const bool talk=std::strstr(aec48_version(),"mask talk-")!=nullptr ||
                     std::strstr(aec48_version(),"mask sing-")!=nullptr; // dual 创建后为讲话档
+    aec48_set_talk_highpass(a, 0);
     bool ok=aec48_set_talk_gate(nullptr,1,-2.75f)==-1;
     ok &= aec48_set_talk_gate(a,1,-2.75f)==(talk?0:-1);
     ok &= aec48_set_talk_gate(a,1,std::numeric_limits<float>::infinity())==-1;
