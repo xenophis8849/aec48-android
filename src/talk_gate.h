@@ -10,7 +10,7 @@ struct TalkGate {
     std::vector<unsigned char> farHist, talkHist;
     std::vector<float> gainHist;
     int farAt = 0, talkAt = 0, gainAt = 0, gainCount = 0;
-    long gainTotal = 0;
+    long long gainTotal = 0;   // 0.8.0 审查：32 位 ABI 上 long 只有 32 位，样本位置须 64 位
     int farCount = 0, talkCount = 0;
     float threshold = -3.0f, currentDb = -40.f;
     double upDb = 32.0, downDb = 40.0 / 18.75;
@@ -49,23 +49,23 @@ struct TalkGate {
         ++gainTotal;
         return g;
     }
-    float gainAtFrame(long frame) const {
+    float gainAtFrame(long long frame) const {
         if (gainCount == 0) return 1.f;
         if (frame < 0) frame = 0;
-        const long oldest = gainTotal - gainCount;
+        const long long oldest = gainTotal - gainCount;
         if (frame < oldest) frame = oldest;
         if (frame >= gainTotal) frame = gainTotal - 1;
         const int start = (gainAt - gainCount + (int)gainHist.size()) % (int)gainHist.size();
         return gainHist[(start + (int)(frame - oldest)) % (int)gainHist.size()];
     }
     // Chain 第 t 帧完成时输出的是原始时间轴 [t−2]H..[t−1]H；插值中心在 jH+H/2。
-    void apply(float* out, long frame, int mode) const {
+    void apply(float* out, long long frame, int mode) const {
         if (mode == 0) return;
-        const long firstSample = (frame - 2) * (long)H;
+        const long long firstSample = (frame - 2) * (long long)H;
         for (int q = 0; q < H; ++q) {
             const double pos = (firstSample + q - H / 2.0) / H;
             if (pos <= 0.0) { out[q] *= gainAtFrame(0); continue; }
-            const long lo = (long)std::floor(pos); const float frac = (float)(pos - lo);
+            const long long lo = (long long)std::floor(pos); const float frac = (float)(pos - lo);
             const float a = gainAtFrame(lo), b = gainAtFrame(lo + 1);
             out[q] *= a + (b - a) * frac;
         }

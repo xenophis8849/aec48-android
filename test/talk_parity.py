@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 import os
 TALK_SRC = Path(os.environ['AEC48_TALK_SRC'])   # 训练侧讲话模型代码目录（含 cofi_aec48.py）
 GATE_PY = Path(os.environ['AEC48_GATE_PY'])   # 离线门参考实现（gate_wav.py）
+TH = float(os.environ.get('AEC48_TALK_TH', '-3.0'))   # 0.8.0 审查：两侧门限一致；--mode gate 的 C 工具用库默认 −3.0，改 TH 时只对 chain 模式有效
 DATA = Path(os.environ.get('AEC48_CKPT_DIR', '.'))
 sys.path.insert(0, os.environ['AEC48_PY_ROOT'])
 spec = importlib.util.spec_from_file_location('cofi_aec48', TALK_SRC/'cofi_aec48.py')
@@ -39,7 +40,7 @@ def gate(ref, logits):
     defs = [x for x in src.body if isinstance(x, ast.FunctionDef)]
     scope = dict(np=np, SR=48000, HOP=384, FARABS=-70)
     exec(compile(ast.Module(body=defs, type_ignores=[]), 'gate_wav.py', 'exec'), scope)
-    g = scope['gain'](ref, logits > -2.75)
+    g = scope['gain'](ref, logits > TH)
     return np.interp(np.arange(len(ref)), np.arange(len(g))*384+192, g)
 
 def stats(v):
@@ -99,7 +100,7 @@ elif a.mode == 'snapshot':
     outputs=[]; zs=[]; ls=[]; spectra=[]
     for enabled in (True,False):
         h=lib.aec48_create(48000,384); assert h
-        assert lib.aec48_set_talk_gate(h,int(enabled),-2.75)==0
+        assert lib.aec48_set_talk_gate(h,int(enabled),TH)==0
         y=np.zeros(n,np.float32)
         buffers=[np.zeros(829,np.float32),np.zeros(1,np.float32)]+[np.zeros(1538,np.float32) for _ in range(5)]
         for t in range(0,n,384):

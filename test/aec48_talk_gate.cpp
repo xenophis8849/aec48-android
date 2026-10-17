@@ -19,7 +19,14 @@ int main(int argc, char** argv) {
         if (std::abs(first - expectedFirst) > 1e-7f || std::abs(second - expectedSecond) > 1e-7f) {
             std::fprintf(stderr, "boundary failed first=%.9g second=%.9g\n", first, second); return 1;
         }
-        std::printf("PASS strict logit threshold, remote-active frame, 32 dB opening step\n"); return 0;
+        // 0.8.0 审查：长时间运行后样本位置超过 2^31（32 位 ABI 的 long），门必须仍取最近的增益而不是最旧的
+        ac::TalkGate g2; g2.init(384, 48000); std::fill(ref, ref + 384, 0.001f);
+        for (int i = 0; i < 100; ++i) g2.push(ref, -10.f);           // 远端有声、判无人 → 压到 −40 dB
+        for (int i = 0; i < 40; ++i) g2.push(ref, 10.f);             // 判有人 → 开门到 0 dB
+        g2.gainTotal += 6000000LL;                                   // 跳到约 13.9 小时之后（6e6 帧 × 384 样本 > 2^31）
+        float buf[384]; std::fill(buf, buf + 384, 1.f); g2.apply(buf, g2.gainTotal - 1, 2);
+        for (int q = 0; q < 384; ++q) if (std::abs(buf[q] - 1.f) > 1e-6f) { std::fprintf(stderr, "long-run failed q=%d gain=%.9g\n", q, buf[q]); return 1; }
+        std::printf("PASS strict logit threshold, remote-active frame, 32 dB opening step, >2^31 sample timeline\n"); return 0;
     }
     if (argc != 4 || std::string(argv[1]) != "--dump") {
         std::fprintf(stderr, "usage: aec48_talk_gate --dump input output | --selftest\n"); return 2;
