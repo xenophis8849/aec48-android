@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Export the frozen t2ae10 CoFi body plus e1be12 gru2 head as mask_talk.gtc.
+"""Export the frozen t2ae10 CoFi body plus a gru2 talk head (current: e10ae12) as mask_talk.gtc.
 
-Usage: python tools/export_talk.py [t2ae10.pt] [e1be12.pt] [mask_talk.gtc]
+Usage: python tools/export_talk.py [t2ae10.pt] [head.pt, default e10ae12] [mask_talk.gtc]
 The defaults point at the documented local model mirror.  This script compares
-all shared body tensors bit-for-bit before taking the gru2 head from e1be12.
+all shared body tensors bit-for-bit before taking the gru2 head from the head checkpoint.
 """
 import os
 import sys
@@ -37,7 +37,7 @@ import cofi_np
 
 DEFAULTS = Path(os.environ.get("AEC48_CKPT_DIR", "."))   # 检查点目录
 body_path = Path(sys.argv[1]) if len(sys.argv) > 1 else DEFAULTS / "aec48_model_talk_t2ae10.pt"
-head_path = Path(sys.argv[2]) if len(sys.argv) > 2 else DEFAULTS / "aec48_model_talk_e1be12.pt"
+head_path = Path(sys.argv[2]) if len(sys.argv) > 2 else DEFAULTS / "aec48_model_talk_e10ae12.pt"
 out_path = Path(sys.argv[3]) if len(sys.argv) > 3 else ROOT / "models/mask_talk.gtc"
 
 def load_state(path):
@@ -49,7 +49,7 @@ def load_state(path):
 body_sd, head_sd = load_state(body_path), load_state(head_path)
 head_keys = {k for k in head_sd if k.startswith("talk_head2.") or k == "talk_head2_v1"}
 if not head_keys or "talk_head2.0.weight" not in head_keys:
-    raise ValueError("e1be12 中没有 gru2 小出口")
+    raise ValueError("判断头检查点中没有 gru2 小出口")
 talk_aux = {k for k in set(body_sd) | set(head_sd) if k.startswith("talk_head.") or k == "talk_head2_v1"}
 shared = sorted(set(body_sd) & set(head_sd) - head_keys - talk_aux)
 body_only = sorted(set(body_sd) - set(head_sd) - talk_aux)
@@ -72,7 +72,7 @@ for k in head_keys:
 net.load_state_dict(merged, strict=True)
 net.eval()
 params = cofi_np.export_params(net)
-for key in head_keys:
+for key in sorted(head_keys):   # 固定顺序（集合遍历顺序随进程变，导出文件只会差在张量先后，内容不变）
     if key.startswith("talk_head2."):
         params[key] = head_sd[key].detach().cpu().numpy().astype(np.float32, copy=True)
 params["talk_head2_v1"] = np.ones((1,), np.float32)

@@ -17,7 +17,7 @@ from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = Path(__file__).resolve().parents[1] / "models/mask_talk.gtc"
-DEFAULT_CKPT = Path(os.environ.get("AEC48_CKPT_DIR", ".")) / "aec48_model_talk_e1be12.pt"
+DEFAULT_CKPT = Path(os.environ.get("AEC48_CKPT_DIR", ".")) / os.environ.get("AEC48_TALK_HEAD_CKPT", "aec48_model_talk_e10ae12.pt")
 MODEL = Path(os.environ.get("AEC48_TALK_GTC", DEFAULT_MODEL))
 CKPT = Path(os.environ.get("AEC48_TALK_CKPT", DEFAULT_CKPT))
 torch.set_num_threads(1)

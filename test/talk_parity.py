@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 import os
 TALK_SRC = Path(os.environ['AEC48_TALK_SRC'])   # 训练侧讲话模型代码目录（含 cofi_aec48.py）
 GATE_PY = Path(os.environ['AEC48_GATE_PY'])   # 离线门参考实现（gate_wav.py）
-TH = float(os.environ.get('AEC48_TALK_TH', '-3.0'))   # 0.8.0 审查：两侧门限一致；--mode gate 的 C 工具用库默认 −3.0，改 TH 只对 chain 模式有效（gate 模式会拒绝）
+TH = float(os.environ.get('AEC48_TALK_TH', '-3.5'))   # 0.8.0 审查：两侧门限一致；--mode gate 的 C 工具用库默认门限（0.11.0 起 −3.5），改 TH 只对 chain 模式有效（gate 模式会拒绝）
 DATA = Path(os.environ.get('AEC48_CKPT_DIR', '.'))
 sys.path.insert(0, os.environ['AEC48_PY_ROOT'])
 spec = importlib.util.spec_from_file_location('cofi_aec48', TALK_SRC/'cofi_aec48.py')
@@ -50,7 +50,7 @@ def stats(v):
 
 def model():
     net = G.GTCRN_AEC48().eval()
-    net.load_state_dict(torch.load(DATA/'aec48_model_talk_e1be12.pt', map_location='cpu', weights_only=False)['model'])
+    net.load_state_dict(torch.load(DATA/os.environ.get('AEC48_TALK_HEAD_CKPT', 'aec48_model_talk_e10ae12.pt'), map_location='cpu', weights_only=False)['model'])
     return net
 
 def pcm(p): return np.fromfile(p, np.int16).astype('float32')/32768
@@ -77,7 +77,7 @@ if a.mode == 'gate':
     path = od/'gate_input.bin'
     with path.open('wb') as f:
         np.array([T],np.int32).tofile(f); ref.tofile(f); logits.tofile(f)
-    if TH != -3.0: sys.exit('gate 模式的 C 工具固定用库默认门限 −3.0；AEC48_TALK_TH 非默认时只能跑 chain 模式')
+    if TH != -3.5: sys.exit('gate 模式的 C 工具固定用库默认门限 −3.5；AEC48_TALK_TH 非默认时只能跑 chain 模式')
     subprocess.run([str(ROOT/a.build/'aec48_talk_gate'),'--dump',str(path),str(od/'gate_gain.bin')], check=True)
     c = np.fromfile(od/'gate_gain.bin',np.float32)
     py = gate(ref,logits)

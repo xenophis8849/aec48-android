@@ -13,8 +13,8 @@
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--selftest") {
         ac::TalkGate gate; gate.init(384, 48000); float ref[384]; std::fill(ref, ref + 384, 0.001f);
-        const float first = gate.push(ref, -3.0f);
-        const float second = gate.push(ref, std::nextafter(-3.0f, INFINITY));
+        const float first = gate.push(ref, -3.5f);
+        const float second = gate.push(ref, std::nextafter(-3.5f, INFINITY));
         const float expectedFirst = 0.01f, expectedSecond = std::pow(10.f, -8.f / 20.f);
         if (std::abs(first - expectedFirst) > 1e-7f || std::abs(second - expectedSecond) > 1e-7f) {
             std::fprintf(stderr, "boundary failed first=%.9g second=%.9g\n", first, second); return 1;
@@ -71,5 +71,5 @@ int main(int argc, char** argv) {
     FILE* f = std::fopen(argv[3], "wb"); if (!f) { std::perror(argv[3]); return 2; }
     const size_t n = std::fwrite(out.data(), sizeof(float), out.size(), f); const int err = std::fclose(f);
     if (n != out.size() || err) { std::fprintf(stderr, "output write failed\n"); return 2; }
-    std::printf("T=%u samples=%zu threshold_logit=-3.0\n", T, out.size()); return 0;
+    std::printf("T=%u samples=%zu threshold_logit=-3.5\n", T, out.size()); return 0;
 }

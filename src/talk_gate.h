@@ -12,7 +12,7 @@ struct TalkGate {
     int farAt = 0, talkAt = 0, gainAt = 0, gainCount = 0;
     long long gainTotal = 0;   // 0.8.0 审查：32 位 ABI 上 long 只有 32 位，样本位置须 64 位
     int farCount = 0, talkCount = 0;
-    float threshold = -3.0f, currentDb = -40.f;
+    float threshold = -3.5f, currentDb = -40.f;
     double upDb = 32.0, downDb = 40.0 / 18.75;
     bool initialized = false;
 
@@ -24,7 +24,7 @@ struct TalkGate {
         gainHist.assign(farN + talkN + 16, 1.f);
         upDb = 40.0 / std::max(10.0 / (1000.0 * H / sr), 1.0);
         downDb = 40.0 / std::max(150.0 / (1000.0 * H / sr), 1.0);
-        threshold = -3.0f;
+        threshold = -3.5f;
         reset();
     }
     // 清掉休眠前的远端、近端与平滑历史。唤醒保护期内仍由 push() 更新历史。

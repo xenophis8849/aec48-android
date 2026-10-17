@@ -139,7 +139,7 @@ struct Chain {
 
     // mic / ref：本块 H 个样本（±1 满幅）；out：H 个样本（= 4 块之前那块的处理结果）。
     // hook 非空时每帧调一次（hookOn = false 时跳过）；pre 非空时同时写出「回调前」的 H 个样本（与 out 同一时间轴）。
-    void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr, aec48_spec_hook2 hook2 = nullptr, void* user2 = nullptr, bool gateOn = true, float gateThreshold = -3.0f, int profile = AEC48_PROFILE_TALK, bool talkHpfOn = true) {
+    void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr, aec48_spec_hook2 hook2 = nullptr, void* user2 = nullptr, bool gateOn = true, float gateThreshold = -3.5f, int profile = AEC48_PROFILE_TALK, bool talkHpfOn = true) {
         talkFrameReady = false;
         if (cnet.hasTalkHead) {
             const int requested = talkHpfOn ? 1 : 0;

@@ -1,5 +1,5 @@
 /*
- * aec48 0.10.2 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.11.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -56,7 +56,7 @@ AEC48_EXPORT int aec48_process_s16(Aec48* a, const short* mic, const short* ref,
 AEC48_EXPORT void aec48_set_enabled(Aec48* a, int on);
 
 /* 讲话模型的交付门。讲话版及 dual 版默认开启；threshold_logit 比较口径为 talk head 原始 logit。
- * dual 的唱歌档不施门，但门设置保留到下次讲话档。可在任意线程调用，包括音频线程；只写原子量、不加锁、不分配。
+ * 默认门限 −3.5（0.11.0 起，判断头换为 e10ae12；0.8–0.10 为 −3.0）。dual 的唱歌档不施门，但门设置保留到下次讲话档。可在任意线程调用，包括音频线程；只写原子量、不加锁、不分配。
  * 讲话版及 dual 版返回 0；其他单档版或空实例返回 -1。 */
 AEC48_EXPORT int aec48_set_talk_gate(Aec48* a, int on, float threshold_logit);
 
@@ -133,7 +133,7 @@ AEC48_EXPORT void aec48_set_spec_hook_enabled(Aec48* a, int on);
 /* 查询帧格式：采样率、窗长、帧移、窗型编号。串接方据此核对自己的格式，对不上就不要挂。 */
 AEC48_EXPORT void aec48_spec_format(const Aec48* a, int* sample_rate, int* nfft, int* hop, int* window_id);
 
-/* 版本与模型标识，例如 "aec48 0.10.2 (lin nlinBc3-dual, mask v59ae20)"。 */
+/* 版本与模型标识，例如 "aec48 0.11.0 (lin nlinBc3-dual, mask v59ae20)"。 */
 AEC48_EXPORT const char* aec48_version(void);
 
 #ifdef __cplusplus

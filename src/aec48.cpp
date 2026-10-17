@@ -188,7 +188,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.10.2 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.11.0 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -204,7 +204,7 @@ Aec48* aec48_create(int sample_rate, int frames_per_call) {
 #endif
         });
         a = new Aec48(); a->sr = sample_rate;
-        { const float th = -3.0f; uint32_t bits; memcpy(&bits, &th, sizeof(bits)); a->talkThresholdBits.store(bits, std::memory_order_relaxed); }
+        { const float th = -3.5f; uint32_t bits; memcpy(&bits, &th, sizeof(bits)); a->talkThresholdBits.store(bits, std::memory_order_relaxed); }
 #ifdef AEC48_DUAL
         if (!a->chain.load("mem:lin", "mem:talk_mask", sample_rate, "mem:sing_mask")) { delete a; return nullptr; }
 #else

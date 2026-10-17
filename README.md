@@ -15,7 +15,7 @@
 | `include/aec48.h` | 全部接口（C） |
 | `prebuilt/arm64-v8a/libaec48.so`、`prebuilt/armeabi-v7a/libaec48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
 | `prebuilt/candidate-v62b/<ABI>/libaec48.so` | 候选版预编译库（0.6 起，掩码 v62be20；接口与默认版相同，见「候选版」） |
-| `prebuilt/talk/<ABI>/libaec48.so` | 讲话版：t2ae10 掩码、e1be12 gru2 判断头与默认开启的平滑门、80 Hz 高通 |
+| `prebuilt/talk/<ABI>/libaec48.so` | 讲话版：t2ae10 掩码、e10ae12 gru2 判断头与默认开启的平滑门、80 Hz 高通 |
 | `prebuilt/dual/<ABI>/libaec48.so` | 双档版：一份线性级、唱歌与讲话两套掩码，可在通话中切档 |
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型，`models_v62b.cpp` 候选版内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
@@ -47,18 +47,18 @@ target_link_libraries(your_audio aec48)
 
 - 候选版的掩码多用两路输入：参考信号按线性级估出的时延挪齐后的频谱，以及由它与线性级输出算出的残余回声估计。两路都在库内部从已有的 `mic` / `ref` 算出，接入方不需要多提供任何数据。
 - 效果：回声为主的时段残留更少（测试向量见「自检」：远端单讲整段消除量 8.2 → 13.0 dB）。
-- 区分版本：当前 `aec48_version()` 返回 `aec48 0.10.2 (lin nlinBc3-dual, mask v62be20 candidate)`，录音的 `meta.json` 的 `version` 同此，回传的录音可据此分辨用的是哪一版。
+- 区分版本：当前 `aec48_version()` 返回 `aec48 0.11.0 (lin nlinBc3-dual, mask v62be20 candidate)`，录音的 `meta.json` 的 `version` 同此，回传的录音可据此分辨用的是哪一版。
 - 库文件大小、内存与默认版基本相同（arm64 2.0 MB；每个实例多约 0.3 MB）。
 
 ### 讲话档
 
-将 `prebuilt/talk/<ABI>/libaec48.so` 放入工程即可使用讲话档；主机或父工程构建时选择 `-DAEC48_MODELS=src/models_talk.cpp`。版本标识为 `lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2`。掩码来自 t2a e10，小出口来自 e1b e12（主体 317 个共享张量逐位一致）；时延跟踪系数为 0.98，唱歌档保留 0.995。讲话档用于语音场景，唱歌场景继续选默认或候选档。
+将 `prebuilt/talk/<ABI>/libaec48.so` 放入工程即可使用讲话档；主机或父工程构建时选择 `-DAEC48_MODELS=src/models_talk.cpp`。版本标识为 `lin nlinBc3-dual, mask talk-t2ae10 + head e10ae12-gru2`。掩码来自 t2a e10，小出口（判断头）来自 e10a e12（主体 317 个共享张量逐位一致；0.11.0 起，之前为 e1b e12）；时延跟踪系数为 0.98，唱歌档保留 0.995。讲话档用于语音场景，唱歌场景继续选默认或候选档。
 
-讲话门默认开启，默认 logit 门限为 −3.0。可以在音频线程调用：
+讲话门默认开启，默认 logit 门限为 −3.5（0.11.0 起；0.8–0.10 的 e1b 判断头为 −3.0）。可以在音频线程调用：
 
 ```c
-aec48_set_talk_gate(a, 1, -3.0f);  /* 开门控，设置判断门限 */
-aec48_set_talk_gate(a, 0, -3.0f);  /* 关闭门控，保留讲话模型输出 */
+aec48_set_talk_gate(a, 1, -3.5f);  /* 开门控，设置判断门限 */
+aec48_set_talk_gate(a, 0, -3.5f);  /* 关闭门控，保留讲话模型输出 */
 ```
 
 讲话版和双档版成功返回 0；其他单档版、空实例或非有限门限返回 −1。开关和门限通过原子量更新，在处理块边界生效，不加锁、不分配。`aec48_set_enabled(a, 0)` 直通时门不作用，内部活跃模型与门状态继续更新。
@@ -78,11 +78,11 @@ aec48_set_talk_highpass(a, 1);  /* 开启高通（默认） */
 
 判断头为 32,929 参数，理论额外约 4 MMAC/s（x86 主机实测每块多约 0.006 ms）。判断头与门已与离线参考实现逐帧对齐（logit 最大差 7e-6，门增益最大差 7e-8）；整链输出的合成方式与唱歌档相同（逐帧反归一后合成）。
 
-模型导出：`tools/export_talk.py`（需 PyTorch，把讲话掩码与判断头合成一个参数包），再运行 `tools/embed_models.py models/lin_nlinBc3.gtc models/mask_talk.gtc "lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2" src/models_talk.cpp`。时延系数在讲话链加载后覆盖，通用线性模型文件保持原值。
+模型导出：`tools/export_talk.py`（需 PyTorch，把讲话掩码与判断头合成一个参数包），再运行 `tools/embed_models.py models/lin_nlinBc3.gtc models/mask_talk.gtc "lin nlinBc3-dual, mask talk-t2ae10 + head e10ae12-gru2" src/models_talk.cpp`。时延系数在讲话链加载后覆盖，通用线性模型文件保持原值。
 
 ### 双档库与通话中切档
 
-双档版使用 `prebuilt/dual/<ABI>/libaec48.so`，SONAME 为 `libaec48.so`，接入只需这一份库。源码构建选择 `-DAEC48_MODELS=src/models_dual.cpp`；内嵌 `lin_nlinBc3` 线性模型、`v59ae20` 唱歌掩码，以及带 `e1be12-gru2` 判断头的 `talk-t2ae10` 讲话掩码。创建后默认为讲话档。
+双档版使用 `prebuilt/dual/<ABI>/libaec48.so`，SONAME 为 `libaec48.so`，接入只需这一份库。源码构建选择 `-DAEC48_MODELS=src/models_dual.cpp`；内嵌 `lin_nlinBc3` 线性模型、`v59ae20` 唱歌掩码，以及带 `e10ae12-gru2` 判断头的 `talk-t2ae10` 讲话掩码。创建后默认为讲话档。
 
 ```c
 aec48_set_profile(a, AEC48_PROFILE_SING); /* 0：唱歌 */
@@ -466,7 +466,8 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前版本：0.10.2。默认版标识 `lin nlinBc3-dual, mask v59ae20`；候选版 `lin nlinBc3-dual, mask v62be20 candidate`；讲话版 `lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2`；双档版 `lin nlinBc3-dual, mask sing-v59ae20 + talk-t2ae10 + head e1be12-gru2`。
+- 当前版本：0.11.0。默认版标识 `lin nlinBc3-dual, mask v59ae20`；候选版 `lin nlinBc3-dual, mask v62be20 candidate`；讲话版 `lin nlinBc3-dual, mask talk-t2ae10 + head e10ae12-gru2`；双档版 `lin nlinBc3-dual, mask sing-v59ae20 + talk-t2ae10 + head e10ae12-gru2`。
+- 0.11.0：讲话判断头换为 e10ae12（同一结构，补充真机分房间录音与满音量外放回声后重训；讲话掩码主体不变），默认门限 −3.5。留出的真机录音上，远端单讲时门被误打开的比例约减半、残余回声更低，近端人声不额外受损；合成测试集上人声各项与 0.10 相当。唱歌、默认、候选版不变。
 - 0.10.2：双档版切档修复与平滑——讲话分支唤醒时清零讲话判断头状态、讲话门保持打开 4 秒（修正切回讲话档后误压近端人声）；切档交叉淡化由 4 块拉长到约 300 ms。固定一个档位全程不切时，各版本输出与 0.10.1 逐字节一致。
 - 0.10.1：回调前录音的高通历史持续独立更新；高通将异常输入样本按零处理，并自动清除异常滤波状态。接口契约与全有限输入下的主输出保持不变。
 - 0.10.0：讲话时域输出默认开启 80 Hz、4 阶 Butterworth 高通，新增 `aec48_set_talk_highpass`，4 块平滑切换。双档仅处理讲话支路，直通不滤；频谱回调契约与算法延迟不变。关闭高通后的讲话输出，以及唱歌、默认、候选输出与 0.9.0 逐字节一致。
