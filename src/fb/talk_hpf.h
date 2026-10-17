@@ -1,8 +1,26 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 namespace fb {
+// Inspect integer bits through a non-inlined pointer helper. Clang may fold
+// an inlined floating-value check to true under -ffast-math.
+static_assert(sizeof(float) == sizeof(std::uint32_t) && sizeof(double) == sizeof(std::uint64_t),
+              "TalkHighpass requires 32-bit float and 64-bit double");
+__attribute__((noinline)) inline bool talkHpfFiniteBits32(const void* p) {
+    std::uint32_t bits;
+    std::memcpy(&bits, p, sizeof(bits));
+    return (bits & UINT32_C(0x7f800000)) != UINT32_C(0x7f800000);
+}
+__attribute__((noinline)) inline bool talkHpfFiniteBits64(const void* p) {
+    std::uint64_t bits;
+    std::memcpy(&bits, p, sizeof(bits));
+    return (bits & UINT64_C(0x7ff0000000000000)) != UINT64_C(0x7ff0000000000000);
+}
+inline bool talkHpfFinite(float x) { return talkHpfFiniteBits32(&x); }
+inline bool talkHpfFinite(double x) { return talkHpfFiniteBits64(&x); }
 
 // Causal fourth-order Butterworth high-pass, implemented as two transposed
 // direct-form-II biquads. Coefficients are calculated for the actual sample
@@ -20,6 +38,18 @@ class TalkHighpass {
             return y;
         }
     } s_[2];
+
+    static double checkedStep(Section& s, double x) {
+        if (!talkHpfFinite(x)) x = 0.0;
+        if (!talkHpfFinite(s.z1) || !talkHpfFinite(s.z2)) s.z1 = s.z2 = 0.0;
+        const double y = s.step(x);
+        if (!talkHpfFinite(s.z1) || !talkHpfFinite(s.z2)) s.z1 = s.z2 = 0.0;
+        return talkHpfFinite(y) ? y : 0.0;
+    }
+
+    float fastStep(float x) {
+        return static_cast<float>(s_[1].step(s_[0].step(x)));
+    }
 
     static void design(Section& s, double sampleRate, double q) {
         const double w = 2.0 * 3.1415926535897932384626433832795 * 80.0 / sampleRate;
@@ -47,11 +77,24 @@ public:
     }
 
     float step(float x) {
-        return static_cast<float>(s_[1].step(s_[0].step(x)));
+        const float y = static_cast<float>(checkedStep(s_[1], checkedStep(s_[0], x)));
+        return talkHpfFinite(y) ? y : 0.f;
     }
 
     void process(const float* input, float* output, int n) {
-        for (int i = 0; i < n; ++i) output[i] = step(input[i]);
+        // Fully finite blocks use the original arithmetic path byte for byte.
+        // Exceptional blocks repair bad samples and section state immediately.
+        bool allFinite = true;
+        for (int i = 0; i < n; ++i) allFinite &= talkHpfFinite(input[i]);
+        for (const auto& s : s_) {
+            allFinite &= talkHpfFinite(s.z1) && talkHpfFinite(s.z2);
+        }
+        if (allFinite) {
+            for (int i = 0; i < n; ++i) output[i] = fastStep(input[i]);
+            for (auto& s : s_) if (!talkHpfFinite(s.z1) || !talkHpfFinite(s.z2)) s.z1 = s.z2 = 0.0;
+        } else {
+            for (int i = 0; i < n; ++i) output[i] = step(input[i]);
+        }
     }
 };
 

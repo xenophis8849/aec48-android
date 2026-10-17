@@ -6,9 +6,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 #include <new>
 #include <utility>
 #include <vector>
+#include <string>
+#include <type_traits>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#ifdef AEC48_TESTING
+extern "C" void aec48_internal_set_prehook_capture(Aec48* a, float* output);
+#endif
 
 static std::atomic<bool> countAlloc{false};
 static std::atomic<unsigned long> allocs{0};
@@ -39,6 +48,231 @@ static void check(bool ok, const char* what) {
 }
 static constexpr double kPi = 3.1415926535897932384626433832795;
 static constexpr int kBlock = 384;
+static bool isTalkVersion();
+
+static std::vector<unsigned char> readBytes(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return {};
+    std::fseek(f, 0, SEEK_END); const long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+    std::vector<unsigned char> v(n > 0 ? (size_t)n : 0);
+    if (n > 0 && std::fread(v.data(), 1, (size_t)n, f) != (size_t)n) v.clear();
+    std::fclose(f); return v;
+}
+static void zeroHook(void*, float* re, float* im, int bins) {
+    std::fill(re, re + bins, 0.f); std::fill(im, im + bins, 0.f);
+}
+
+template<class Sample, class Process>
+static bool prehookRestartCase(int sr, bool irregular, int drainBlocks, Process process, const char* tag) {
+    const int phase = (sr / 2 / kBlock) * kBlock;
+    const int rehookAt = phase + drainBlocks * kBlock;
+    const int total = rehookAt + 12 * kBlock;
+    std::vector<Sample> mic(total), ref(total), baselineOut(total), testOut(total);
+    for (int i = 0; i < total; ++i) {
+        const float x = (float)(.18 * std::sin(2 * kPi * 50 * i / sr) + .11 * std::sin(2 * kPi * 250 * i / sr));
+        if constexpr (sizeof(Sample) == sizeof(short)) mic[i] = (short)std::lrint(std::max(-.99f, std::min(.99f, x)) * 32767.f);
+        else mic[i] = (Sample)x;
+    }
+    char tmp[] = "/tmp/aec48-hpf-restart-XXXXXX";
+    char* dir = mkdtemp(tmp); if (!dir) return false;
+    const std::string d(dir), basePath = d + "/base", testPath = d + "/test";
+    const bool dirsOk = mkdir(basePath.c_str(), 0700) == 0 && mkdir(testPath.c_str(), 0700) == 0;
+    int lens[] = {733, 251, 509, 384, 1021, 127}; int li = 0;
+    std::vector<float> baseRaw(total, 0.f), testRaw(total, 0.f);
+    bool callsOk = true;
+    auto runCalls = [&](Aec48* a, int begin, int end, std::vector<float>& capture, std::vector<Sample>& output) {
+        int at = begin;
+        while (at < end) {
+            int n = irregular ? lens[li++ % 6] : kBlock;
+            n = std::min(n, end - at);
+#ifdef AEC48_TESTING
+            aec48_internal_set_prehook_capture(a, capture.data() + at);
+#else
+            (void)capture;
+#endif
+            callsOk &= process(a, mic.data() + at, ref.data() + at, output.data() + at, n) == 0;
+            at += n;
+        }
+    };
+    Aec48* a = aec48_create(sr, irregular ? 0 : kBlock); Aec48* b = aec48_create(sr, irregular ? 0 : kBlock);
+    if (!a || !b) { if (a) aec48_destroy(a); if (b) aec48_destroy(b); return false; }
+    callsOk &= aec48_set_talk_highpass(a, 1) == 0 && aec48_set_talk_highpass(b, 1) == 0;
+    callsOk &= aec48_dump_start(a, basePath.c_str()) == 0;
+    runCalls(a, 0, phase, baseRaw, baselineOut); runCalls(a, phase, rehookAt, baseRaw, baselineOut);
+    runCalls(a, rehookAt, total, baseRaw, baselineOut); aec48_dump_stop(a);
+    callsOk &= aec48_dump_status(a) == 0;
+    li = 0;
+    callsOk &= aec48_set_spec_hook(b, zeroHook, nullptr) == 0;
+    runCalls(b, 0, phase, testRaw, testOut);
+    callsOk &= aec48_set_spec_hook(b, nullptr, nullptr) == 0;
+    runCalls(b, phase, rehookAt, testRaw, testOut);
+    callsOk &= aec48_set_spec_hook(b, zeroHook, nullptr) == 0;
+    callsOk &= aec48_dump_start(b, testPath.c_str()) == 0;
+    runCalls(b, rehookAt, total, testRaw, testOut); aec48_dump_stop(b);
+    callsOk &= aec48_dump_status(b) == 0;
+    aec48_destroy(a); aec48_destroy(b);
+    const auto expected = readBytes(basePath + "/out.wav");
+    const auto actual = readBytes(testPath + "/out_prehook.wav");
+    // WAV headers differ in recorded duration. The captured tail must match the corresponding baseline bytes exactly.
+    const size_t header = 44, offset = header + (size_t)rehookAt * sizeof(short);
+    bool ok = dirsOk && callsOk && actual.size() >= header &&
+              actual.size() == header + (size_t)(total - rehookAt) * 2 &&
+              expected.size() >= offset + (actual.size() - header);
+    if (ok) ok = std::memcmp(expected.data() + offset, actual.data() + header, actual.size() - header) == 0;
+    if (ok && sizeof(Sample) == sizeof(short))
+        ok = expected.size() == header + (size_t)total * sizeof(short) &&
+             std::memcmp(expected.data() + header, baselineOut.data(), (size_t)total * sizeof(short)) == 0;
+#ifdef AEC48_TESTING
+    const size_t tail = (size_t)(total - rehookAt);
+    if (ok && sizeof(Sample) == sizeof(float))
+        ok = std::memcmp(baselineOut.data() + rehookAt, testRaw.data() + rehookAt, tail * sizeof(float)) == 0;
+    if (ok && sizeof(Sample) == sizeof(short))
+        ok = std::memcmp(baseRaw.data() + rehookAt, testRaw.data() + rehookAt, tail * sizeof(float)) == 0;
+#endif
+    std::printf("%s HPF prehook restart sr=%d drain=%d %s %s\n", ok ? "PASS" : "FAIL", sr, drainBlocks, sizeof(Sample) == 2 ? "int16" : "float", irregular ? "irregular" : "384");
+    (void)tag;
+    return ok;
+}
+
+static void prehookRestartRegression() {
+    if (!isTalkVersion()) return;
+#ifndef AEC48_TESTING
+    std::puts("NOTE raw prehook float byte comparison skipped (requires AEC48_TESTING)");
+#endif
+    for (int sr : {48000, 44100}) for (int drain : {4, 8}) {
+        bool ok = true;
+        ok &= prehookRestartCase<float>(sr, false, drain, [](Aec48* a, const float* m, const float* r, float* o, int n) { return aec48_process(a, m, r, o, n); }, "float");
+        ok &= prehookRestartCase<float>(sr, true, drain, [](Aec48* a, const float* m, const float* r, float* o, int n) { return aec48_process(a, m, r, o, n); }, "float");
+        ok &= prehookRestartCase<short>(sr, false, drain, [](Aec48* a, const short* m, const short* r, short* o, int n) { return aec48_process_s16(a, m, r, o, n); }, "int16");
+        ok &= prehookRestartCase<short>(sr, true, drain, [](Aec48* a, const short* m, const short* r, short* o, int n) { return aec48_process_s16(a, m, r, o, n); }, "int16");
+        char label[128]; std::snprintf(label, sizeof label, "prehook restart byte comparison (sr=%d, drain=%d)", sr, drain);
+        check(ok, label);
+    }
+}
+
+__attribute__((noinline)) static bool finiteBitsAt(const void* address) {
+    uint32_t bits = 0; std::memcpy(&bits, address, sizeof bits);
+    return (bits & 0x7f800000u) != 0x7f800000u;
+}
+static uint32_t orderedFloatBitsAt(const void* address) {
+    uint32_t bits = 0; std::memcpy(&bits, address, sizeof bits);
+    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
+static uint32_t ulpDistanceAt(const void* a, const void* b) {
+    const uint32_t x = orderedFloatBitsAt(a), y = orderedFloatBitsAt(b);
+    return x > y ? x - y : y - x;
+}
+static void setFloatBits(float* dst, uint32_t bits) { std::memcpy(dst, &bits, sizeof bits); }
+static_assert(std::is_standard_layout<fb::TalkHighpass>::value, "TalkHighpass test byte access requires standard layout");
+static_assert(sizeof(fb::TalkHighpass) == 14 * sizeof(double), "TalkHighpass test byte access requires two seven-double sections");
+static void setSectionStateBits(fb::TalkHighpass& hp, int section, int state, uint64_t bits) {
+    // TalkHighpass currently stores two seven-double sections, with z1/z2 last.
+    // This test-only byte access lets the regression exercise otherwise unreachable corrupted state.
+    const size_t off = ((size_t)section * 7 + 5 + (size_t)state) * sizeof(double);
+    std::memcpy(reinterpret_cast<unsigned char*>(&hp) + off, &bits, sizeof bits);
+}
+struct NonfiniteHook { int frame = 0; bool inject = true; };
+static void injectNonfinite(void* u, float* re, float* im, int bins) {
+    NonfiniteHook* h = (NonfiniteHook*)u;
+    if (h->frame++ == 9 && h->inject && bins > 17) {
+        setFloatBits(re + 13, 0x7fc00001u);
+        setFloatBits(im + 17, 0x7f800000u);
+    }
+}
+static std::vector<float> runNonfiniteChain(int hpf, bool inject, bool dual) {
+    const int sr = 48000, n = 32 * kBlock;
+    Aec48* a = aec48_create(sr, kBlock); if (!a) return {};
+    if (aec48_set_talk_highpass(a, hpf) != 0) { aec48_destroy(a); return {}; }
+    if (dual && aec48_set_profile(a, AEC48_PROFILE_TALK) != 0) { aec48_destroy(a); return {}; }
+    aec48_set_talk_gate(a, 0, -3.f); aec48_set_enabled(a, 1);
+    NonfiniteHook ctx; ctx.inject = inject;
+    if (aec48_set_spec_hook(a, injectNonfinite, &ctx) != 0) { aec48_destroy(a); return {}; }
+    std::vector<float> mic(n), ref(n, 0.f), out(n);
+    for (int i = 0; i < n; ++i) mic[i] = .18f * std::sin((float)(2 * kPi * 250 * i / sr));
+    for (int b = 0; b < n / kBlock; ++b) {
+        if (aec48_process(a, mic.data() + b * kBlock, ref.data() + b * kBlock,
+                          out.data() + b * kBlock, kBlock) != 0) { aec48_destroy(a); return {}; }
+    }
+    aec48_destroy(a); return out;
+}
+static void nonfiniteRecovery() {
+    // Compare the filter to the same input with non-finite samples replaced by zero.
+    const int n = 24 * kBlock; std::vector<float> in(n), clean(n), actual(n), expected(n);
+    for (int i = 0; i < n; ++i) in[i] = clean[i] = .3f * std::sin((float)(i * .071));
+    const int nanAt = 10 * kBlock + 37, infAt = 10 * kBlock + 141;
+    setFloatBits(&in[nanAt], 0x7fc00001u); setFloatBits(&in[infAt], 0x7f800000u);
+    clean[nanAt] = clean[infAt] = 0.f;
+    fb::TalkHighpass hp, reference; hp.init(48000); reference.init(48000);
+    hp.process(in.data(), actual.data(), n); reference.process(clean.data(), expected.data(), n);
+    bool equal = std::memcmp(actual.data(), expected.data(), n * sizeof(float)) == 0;
+    bool allFinite = true; for (const float& x : actual) allFinite &= finiteBitsAt(&x);
+    check(equal && allFinite, "TalkHighpass matches zero-substituted reference with preserved finite filter history");
+
+    bool eachSection = true;
+    const uint64_t badState[] = {UINT64_C(0x7ff8000000000001),
+                                 UINT64_C(0x7ff0000000000000),
+                                 UINT64_C(0xfff0000000000000)};
+    for (int sr : {48000, 44100}) {
+        for (int section = 0; section < 2; ++section) for (int state = 0; state < 2; ++state) for (uint64_t bad : badState) {
+            fb::TalkHighpass damaged, cleared; damaged.init(sr); cleared.init(sr);
+            for (int i = 0; i < 97; ++i) { const float x = .2f * std::sin(i * .13f); damaged.step(x); cleared.step(x); }
+            setSectionStateBits(damaged, section, state, bad);
+            setSectionStateBits(cleared, section, 0, 0); setSectionStateBits(cleared, section, 1, 0);
+            for (int i = 0; i < 128; ++i) {
+                const float x = .17f * std::cos((97 + i) * .09f);
+                const float x1 = damaged.step(x), x2 = cleared.step(x);
+                eachSection &= std::memcmp(&x1, &x2, sizeof(float)) == 0 && finiteBitsAt(&x1);
+            }
+        }
+    }
+    check(eachSection, "each biquad section clears non-finite z1/z2 and matches a section-reset reference");
+
+    const bool dualBuild = std::strstr(aec48_version(), "sing-v59ae20") != nullptr;
+    if (!isTalkVersion() && !dualBuild) return;
+    const auto badChain = runNonfiniteChain(1, true, dualBuild);
+    bool finiteTail = badChain.size() == 32u * kBlock;
+    for (size_t i = 19u * kBlock; finiteTail && i < badChain.size(); ++i) finiteTail &= finiteBitsAt(&badChain[i]);
+    check(finiteTail, dualBuild ? "dual talk lane is finite from block 20 after NaN/Inf hook input" : "talk lane is finite from block 20 after NaN/Inf hook input");
+    const auto dry = runNonfiniteChain(0, true, dualBuild);
+    std::vector<float> sanitized = dry, oracle(dry.size());
+    for (float& x : sanitized) if (!finiteBitsAt(&x)) x = 0.f;
+    fb::TalkHighpass expectedHpf; expectedHpf.init(48000);
+    expectedHpf.process(sanitized.data(), oracle.data(), (int)oracle.size());
+    bool chainAllFinite = badChain.size() == 32u * kBlock && oracle.size() == badChain.size();
+    size_t samplesDifferent = 0; uint32_t maxUlp = 0; double maxAbs = 0.0;
+    const size_t compareCount = std::min(badChain.size(), oracle.size());
+    for (size_t i = 0; i < compareCount; ++i) {
+        const bool actualFinite = finiteBitsAt(&badChain[i]);
+        const bool expectedFinite = finiteBitsAt(&oracle[i]);
+        chainAllFinite &= actualFinite && expectedFinite;
+        samplesDifferent += std::memcmp(&badChain[i], &oracle[i], sizeof(float)) != 0;
+        if (!actualFinite || !expectedFinite) continue;
+        maxUlp = std::max(maxUlp, ulpDistanceAt(&badChain[i], &oracle[i]));
+        const double delta = (double)badChain[i] - (double)oracle[i];
+        maxAbs = std::max(maxAbs, delta < 0.0 ? -delta : delta);
+    }
+    const size_t tailAt = 19u * kBlock;
+    const bool tailBytesEqual = chainAllFinite && badChain.size() > tailAt &&
+        std::memcmp(badChain.data() + tailAt, oracle.data() + tailAt,
+                    (badChain.size() - tailAt) * sizeof(float)) == 0;
+    std::printf("injected chain oracle: samples_different=%zu max_ulp=%u max_abs=%.17g tail_bytes_equal=%d\n",
+                samplesDifferent, maxUlp, maxAbs, tailBytesEqual ? 1 : 0);
+    check(chainAllFinite && maxUlp <= 1 && tailBytesEqual,
+          dualBuild ? "dual injected chain matches oracle within 1 ULP and byte-identically from block 20" :
+                      "talk injected chain matches oracle within 1 ULP and byte-identically from block 20");
+
+    // With finite callback data, the production chain and independent filter oracle stay byte-identical throughout.
+    const auto noInjectDry = runNonfiniteChain(0, false, dualBuild);
+    const auto noInjectChain = runNonfiniteChain(1, false, dualBuild);
+    std::vector<float> noInjectOracle(noInjectDry.size());
+    fb::TalkHighpass noInjectHpf; noInjectHpf.init(48000);
+    noInjectHpf.process(noInjectDry.data(), noInjectOracle.data(), (int)noInjectOracle.size());
+    const bool noInjectExact = noInjectChain.size() == noInjectOracle.size() && !noInjectChain.empty() &&
+        std::memcmp(noInjectChain.data(), noInjectOracle.data(), noInjectOracle.size() * sizeof(float)) == 0;
+    check(noInjectExact, "finite injected-chain control remains byte-identical to the HPF oracle");
+    bool dryHasNonfinite = false; for (const float& x : dry) dryHasNonfinite |= !finiteBitsAt(&x);
+    check(dryHasNonfinite, "disabled HPF retains the original dry non-finite output behavior");
+}
 
 static double gain(int sr, double hz) {
     fb::TalkHighpass hp;
@@ -271,6 +505,8 @@ static void hookContract() {
 
 int main() {
     apiAndRealtime();
+    prehookRestartRegression();
+    nonfiniteRecovery();
     bool response = true;
     for (int sr : {48000, 44100}) {
         const double g50 = gain(sr, 50), g80 = gain(sr, 80), g100 = gain(sr, 100), g300 = gain(sr, 300);

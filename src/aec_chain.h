@@ -5,7 +5,7 @@
 //   时延不变时与评估逐样本相同，只在时延改判的那几帧有差别。参考历史按线性级最大时延 K 帧留够。
 // mode：0 = 直通（输出麦克风，延迟相同）；1 = 只线性级；2 = 整链。切换不清状态。
 // 频谱回调（0.5）：每帧输出频谱在合成前交给 hook 原地修改（各 mode 都调；第 1 块不调，第 2 块起每块一帧，第 c 次调用的窗覆盖输入 [c·H − 768, c·H + 768)，负索引补零）；调完把直流 / 奈奎斯特虚部置 0。
-//   pre 非空时另做一路「回调前」的合成（录音用）：回调开着才多一次逆变换，没挂 / 关着直接复用同一帧（只多一次重叠相加）。
+//   回调前一路始终独立合成并推进高通；回调开着时另做一次逆变换，没挂 / 关着复用同一帧。
 #pragma once
 #include "fb/nlin.h"
 #include "fb/cofi.h"
@@ -48,7 +48,7 @@ struct Chain {
 #endif
     fb::TalkHighpass talkHpf;
     fb::TalkHighpass preTalkHpf;
-    std::vector<float> hpfScratch, preHpfScratch, hpfWeights;
+    std::vector<float> hpfScratch, preHpfScratch, preHpfDry, hpfWeights;
     float hpfMix = 1.f, hpfFrom = 1.f;
     int hpfTarget = 1, hpfFadeAt = 0;
     bool hpfStarted = false;
@@ -87,6 +87,7 @@ struct Chain {
         sideResid.assign(F, 0.f); sideRhat.assign(F, 0.f); sidePowerNorm.assign(F, 0.f); sideEr.assign(F, 0.f); sideXr.assign(F, 0.f);
         farWinN = (int)std::ceil(sr / H); farWin.assign(farWinN, 0); farWinAt = farWinCount = 0; farPeak = 0;
         if (cnet.hasTalkHead) talkGate.init(H, (int)sampleRate);
+        preHpfDry.assign(H, 0.f);
         if (cnet.hasTalkHead) {
             if (!talkHpf.init(sampleRate) || !preTalkHpf.init(sampleRate)) return false;
             hpfScratch.assign(H, 0.f); preHpfScratch.assign(H, 0.f); hpfWeights.assign(H, 0.f);
@@ -118,7 +119,6 @@ struct Chain {
 #ifdef AEC48_DUAL
         accPSing = accSing;
 #endif
-        preTalkHpf = talkHpf;
     }
 
     // mic / ref：本块 H 个样本（±1 满幅）；out：H 个样本（= 4 块之前那块的处理结果）。
@@ -267,7 +267,7 @@ struct Chain {
             farPeak = std::max(farPeak, tot); const unsigned char active = (double)tot > farPeak * 1e-5 + 1e-12;
             farWinCount -= farWin[farWinAt] != 0; farWin[farWinAt] = active; farWinCount += active; if (++farWinAt == farWinN) farWinAt = 0;
         }
-        if (pre && anyHook) {
+        if (anyHook) {
 #ifdef AEC48_DUAL
             const cf* primary = crossing ? FXPrimary.data() : FX.data();
             if (runTalk) addSpectrum(profile == AEC48_PROFILE_TALK ? primary : FXOther.data(), accP, xp.data());
@@ -324,7 +324,7 @@ struct Chain {
         const cf* primaryPost = crossing ? FXPrimary.data() : FX.data();
         if (runTalk) addSpectrum(profile == AEC48_PROFILE_TALK ? primaryPost : FXOther.data(), acc, xw.data());
         if (runSing) addSpectrum(profile == AEC48_PROFILE_SING ? primaryPost : FXOther.data(), accSing, xw.data());
-        if (pre && !anyHook) {
+        if (!anyHook) {
             if (runTalk) addSpectrum(profile == AEC48_PROFILE_TALK ? primaryPost : FXOther.data(), accP, xp.data());
             if (runSing) addSpectrum(profile == AEC48_PROFILE_SING ? primaryPost : FXOther.data(), accPSing, xp.data());
         }
@@ -332,14 +332,12 @@ struct Chain {
         for (int q = 0; q < H; ++q) {
             if (runTalk) outTalk[q] = wacc[q] > 1e-8f ? acc[q] / wacc[q] : 0.f;
             if (runSing) outSing[q] = wacc[q] > 1e-8f ? accSing[q] / wacc[q] : 0.f;
-            if (pre) {
-                if (runTalk) preTalk[q] = wacc[q] > 1e-8f ? accP[q] / wacc[q] : 0.f;
-                if (runSing) preSing[q] = wacc[q] > 1e-8f ? accPSing[q] / wacc[q] : 0.f;
-            }
+            if (runTalk) preTalk[q] = wacc[q] > 1e-8f ? accP[q] / wacc[q] : 0.f;
+            if (runSing) preSing[q] = wacc[q] > 1e-8f ? accPSing[q] / wacc[q] : 0.f;
         }
         if (runTalk && gateOn) {
             talkGate.apply(outTalk.data(), talkFrames - 1, mode);
-            if (pre) talkGate.apply(preTalk.data(), talkFrames - 1, mode);
+            talkGate.apply(preTalk.data(), talkFrames - 1, mode);
         }
         // Filter the talk lane before the profile crossfade. When the talk
         // lane sleeps in dual mode, feed the live singing lane through the
@@ -348,9 +346,9 @@ struct Chain {
             const float* hpfInput = runTalk ? outTalk.data() : outSing.data();
             talkHpf.process(hpfInput, hpfScratch.data(), H);
             const float* preInput = runTalk ? preTalk.data() : preSing.data();
-            if (pre) preTalkHpf.process(preInput, preHpfScratch.data(), H);
+            preTalkHpf.process(preInput, preHpfScratch.data(), H);
             float* talkLane = runTalk ? outTalk.data() : nullptr;
-            float* preLane = pre && runTalk ? preTalk.data() : nullptr;
+            float* preLane = runTalk ? preTalk.data() : nullptr;
             for (int q = 0; q < H; ++q) {
                 float w = hpfMix;
                 if (hpfFadeAt < 4 * H) {
@@ -379,12 +377,12 @@ struct Chain {
         else { memcpy(out, outSing.data(), H * sizeof(float)); if (pre) memcpy(pre, preSing.data(), H * sizeof(float)); }
         if (runTalk) { memmove(acc.data(), acc.data() + H, (N - H) * 4); memset(acc.data() + N - H, 0, H * 4); }
         if (runSing) { memmove(accSing.data(), accSing.data() + H, (N - H) * 4); memset(accSing.data() + N - H, 0, H * 4); }
-        if (pre && runTalk) { memmove(accP.data(), accP.data() + H, (N - H) * 4); memset(accP.data() + N - H, 0, H * 4); }
-        if (pre && runSing) { memmove(accPSing.data(), accPSing.data() + H, (N - H) * 4); memset(accPSing.data() + N - H, 0, H * 4); }
+        if (runTalk) { memmove(accP.data(), accP.data() + H, (N - H) * 4); memset(accP.data() + N - H, 0, H * 4); }
+        if (runSing) { memmove(accPSing.data(), accPSing.data() + H, (N - H) * 4); memset(accPSing.data() + N - H, 0, H * 4); }
 #else
         rf.inv(FX.data(), xw.data());
         for (int q = 0; q < N; ++q) { acc[q] += xw[q] * win[q]; wacc[q] += win[q] * win[q]; }
-        if (pre && !anyHook) for (int q = 0; q < N; ++q) accP[q] += xw[q] * win[q];       // 回调没调：回调前 = 回调后
+        if (!anyHook) for (int q = 0; q < N; ++q) accP[q] += xw[q] * win[q];       // 回调没调：回调前 = 回调后
         for (int q = 0; q < H; ++q) out[q] = wacc[q] > 1e-8f ? acc[q] / wacc[q] : 0.f;
         if (cnet.hasTalkHead && gateOn) talkGate.apply(out, k - 2, mode);
         if (cnet.hasTalkHead) {
@@ -401,18 +399,19 @@ struct Chain {
                 else if (mode != 0 && w > 0.f) out[q] = (1.f - w) * out[q] + w * hpfScratch[q];
             }
         }
-        if (pre) for (int q = 0; q < H; ++q) pre[q] = wacc[q] > 1e-8f ? accP[q] / wacc[q] : 0.f;
-        if (cnet.hasTalkHead && gateOn && pre) talkGate.apply(pre, k - 2, mode);
-        if (cnet.hasTalkHead && pre) {
-            preTalkHpf.process(pre, preHpfScratch.data(), H);
+        for (int q = 0; q < H; ++q) preHpfDry[q] = wacc[q] > 1e-8f ? accP[q] / wacc[q] : 0.f;
+        if (cnet.hasTalkHead && gateOn) talkGate.apply(preHpfDry.data(), k - 2, mode);
+        if (cnet.hasTalkHead) {
+            preTalkHpf.process(preHpfDry.data(), preHpfScratch.data(), H);
             for (int q = 0; q < H; ++q) {
                 const float w = hpfWeights[q];
-                if (mode != 0 && w >= 1.f) pre[q] = preHpfScratch[q];
-                else if (mode != 0 && w > 0.f) pre[q] = (1.f - w) * pre[q] + w * preHpfScratch[q];
+                if (mode != 0 && w >= 1.f) preHpfDry[q] = preHpfScratch[q];
+                else if (mode != 0 && w > 0.f) preHpfDry[q] = (1.f - w) * preHpfDry[q] + w * preHpfScratch[q];
             }
         }
+        if (pre) memcpy(pre, preHpfDry.data(), H * sizeof(float));
         memmove(acc.data(), acc.data() + H, (N - H) * 4); memset(acc.data() + N - H, 0, H * 4);
-        if (pre) { memmove(accP.data(), accP.data() + H, (N - H) * 4); memset(accP.data() + N - H, 0, H * 4); }
+        memmove(accP.data(), accP.data() + H, (N - H) * 4); memset(accP.data() + N - H, 0, H * 4);
 #endif
         memmove(wacc.data(), wacc.data() + H, (N - H) * 4); memset(wacc.data() + N - H, 0, H * 4);
     }

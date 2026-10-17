@@ -84,6 +84,9 @@ struct Aec48 {
     std::atomic<int> requestedProfile{AEC48_PROFILE_TALK}, activeProfile{AEC48_PROFILE_TALK};
     std::atomic<int> talkGateOn{1}; std::atomic<uint32_t> talkThresholdBits{0};
     std::vector<float> tmpO, tmpP;   // 取输出的中转（H 个，create 时分配）
+#ifdef AEC48_TESTING
+    float* testPreCapture = nullptr;   // 仅自检：当前 process 调用的原始回调前 float 输出
+#endif
     ac::SpecHook hook = nullptr; aec48_spec_hook2 hook2 = nullptr; void* hookUser = nullptr; std::atomic<int> hookOn{1}; std::atomic<int> inProc{0};
     int preDrain = 0;   // 摘掉回调后还要接着维护「回调前」那路的块数（重叠相加里残留着被回调改过的帧，4 块后两路才相等）
     // 统计
@@ -105,9 +108,9 @@ static void block(Aec48* a, const float* m, const float* r, long evPos) {
     auto t0 = std::chrono::steady_clock::now();
     const int en = a->enabled.load(std::memory_order_relaxed), ho = a->hookOn.load(std::memory_order_relaxed);
     if (evPos >= 0) { if (en != a->evLastEn) { noteEv(a, evPos, 0, en); a->evLastEn = en; } if (ho != a->evLastHo) { noteEv(a, evPos, 1, ho); a->evLastHo = ho; } }
-    // 「回调前」那路只在挂着回调、以及摘掉后的 4 块里维护（不挂回调的用户不付这份开销）；其余时候它就等于输出，直接拷。
-    // 摘掉后马上重挂时状态仍在维护，不会从回调后的状态拷（Codex 审查 0.5 P2）
-    const bool pre = a->hook || a->hook2 || a->preDrain > 0; if (!a->hook && !a->hook2 && a->preDrain > 0) --a->preDrain;
+    // 讲话版始终取出独立的回调前路，避免重挂时输出队列带入门后 IIR 尾迹。
+    // 其他版本仍在挂回调和 OLA 排空期间取出该路。
+    const bool pre = a->chain.cnet.hasTalkHead || a->hook || a->hook2 || a->preDrain > 0; if (!a->hook && !a->hook2 && a->preDrain > 0) --a->preDrain;
     const uint32_t thresholdBits = a->talkThresholdBits.load(std::memory_order_relaxed); float threshold; memcpy(&threshold, &thresholdBits, sizeof(threshold));
 #ifdef AEC48_DUAL
     const int profile = a->requestedProfile.load(std::memory_order_relaxed);
@@ -166,10 +169,16 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
         for (;;) { const int want = std::min(consumed - produced, H); if (want <= 0) break;
             const int got = (int)a->outQ.pop(a->tmpO.data(), want); if (!got) break;
             a->outP.pop(a->tmpP.data(), got);   // 与 outQ 同步：两边推的量始终相同
+#ifdef AEC48_TESTING
+            if (a->testPreCapture) memcpy(a->testPreCapture + produced, a->tmpP.data(), got * sizeof(float));
+#endif
             out.put(produced, a->tmpO.data(), got); if (rec) { a->dq[2].push(a->tmpO.data(), got); if (a->nTr == 4) a->dq[3].push(a->tmpP.data(), got); } produced += got; }
     }
     if (produced < n) {   // 只在 frames_per_call 声明为 H 的整数倍、实际却传了别的长度时发生：补零、返回 1 并计数
         out.zero(produced, n - produced);
+#ifdef AEC48_TESTING
+        if (a->testPreCapture) memset(a->testPreCapture + produced, 0, (n - produced) * sizeof(float));
+#endif
         if (rec) for (int k = produced; k < n; k += 384) for (int t = 2; t < a->nTr; ++t) a->dq[t].push(kZero, std::min(384, n - k));
         a->outPadded.fetch_add(n - produced);
     }
@@ -179,7 +188,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.10.0 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.10.1 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -349,6 +358,10 @@ void aec48_destroy(Aec48* a) { if (!a) return; aec48_dump_stop(a); delete a; }
 // 仅供仓库自带的健壮性测试用（不在头文件里）：改下一次 dump_start 的录音队列容量（2 的幂），用来稳定复现"丢包超过上限"。
 __attribute__((visibility("default"))) void aec48_internal_set_dump_capacity(Aec48* a, unsigned long pow2) { if (a && pow2 >= 1024 && !(pow2 & (pow2 - 1))) a->dqCap = pow2; }
 #ifdef AEC48_TESTING
+// 仅供自检取出一次 process 的原始回调前样本；调用者保证缓冲区长度足够。
+__attribute__((visibility("default"))) void aec48_internal_set_prehook_capture(Aec48* a, float* output) {
+    if (a) a->testPreCapture = output;
+}
 // 仅供讲话版逐帧对账：829 维 talk 输入、logit，以及 769 个复数频点的交错复谱数组。
 // 每个复谱数组长度为 1538 float；无完整 talk 帧时返回 0。
 __attribute__((visibility("default"))) int aec48_internal_talk_snapshot(Aec48* a, float* talkInput829, float* logit1,

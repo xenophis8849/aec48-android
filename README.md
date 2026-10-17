@@ -465,7 +465,8 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前版本：0.10.0。默认版标识 `lin nlinBc3-dual, mask v59ae20`；候选版 `lin nlinBc3-dual, mask v62be20 candidate`；讲话版 `lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2`；双档版 `lin nlinBc3-dual, mask sing-v59ae20 + talk-t2ae10 + head e1be12-gru2`。
+- 当前版本：0.10.1。默认版标识 `lin nlinBc3-dual, mask v59ae20`；候选版 `lin nlinBc3-dual, mask v62be20 candidate`；讲话版 `lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2`；双档版 `lin nlinBc3-dual, mask sing-v59ae20 + talk-t2ae10 + head e1be12-gru2`。
+- 0.10.1：回调前录音的高通历史持续独立更新；高通将异常输入样本按零处理，并自动清除异常滤波状态。接口契约与全有限输入下的主输出保持不变。
 - 0.10.0：讲话时域输出默认开启 80 Hz、4 阶 Butterworth 高通，新增 `aec48_set_talk_highpass`，4 块平滑切换。双档仅处理讲话支路，直通不滤；频谱回调契约与算法延迟不变。关闭高通后的讲话输出，以及唱歌、默认、候选输出与 0.9.0 逐字节一致。
 - 0.9.0：新增双档库与 `aec48_set_profile` / `aec48_get_profile`，保留线性级与独立掩码状态，4 块逐样本交叉淡化。双档默认讲话；单档库只接受自身档位。默认、候选、讲话版的处理输出与 0.8.1 逐字节一致，频谱回调契约仍为 2。
 - 0.7.0 修改 **【联动】**（默认版、候选版处理结果不变）：频谱回调契约升至 2，增加 `aec48_set_spec_hook2` 与 `Aec48SpecSide`，每帧提供处理模式、远端活动和残余回声功率；近端说话概率暂不提供。第 1 版回调行为不变，旧二进制不受影响；重编时契约检查应接受 `AEC48_SPEC_CONTRACT_VERSION >= 1`。录音 `meta.json` 的 `spec_hook` 增加 `contract_version`。
