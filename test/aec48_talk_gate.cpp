@@ -26,7 +26,25 @@ int main(int argc, char** argv) {
         g2.gainTotal += 6000000LL;                                   // 跳到约 13.9 小时之后（6e6 帧 × 384 样本 > 2^31）
         float buf[384]; std::fill(buf, buf + 384, 1.f); g2.apply(buf, g2.gainTotal - 1, 2);
         for (int q = 0; q < 384; ++q) if (std::abs(buf[q] - 1.f) > 1e-6f) { std::fprintf(stderr, "long-run failed q=%d gain=%.9g\n", q, buf[q]); return 1; }
-        std::printf("PASS strict logit threshold, remote-active frame, 32 dB opening step, >2^31 sample timeline\n"); return 0;
+        // Actual per-sample apply check: after a closed sleeping gate, force the wake
+        // gains to 0 dB and verify every output sample in the configured W window.
+        for (int reset = 0; reset <= 1; ++reset) {
+            ac::TalkGate gw; gw.init(384, 48000); std::fill(ref, ref + 384, 0.001f);
+            for (int i = 0; i < 200; ++i) gw.push(ref, -10.f);
+            if (reset) gw.resetHistory();
+            gw.forceRecentOpen(3);
+            const int wFrames = (int)std::ceil(0.5 * 48000 / 384.0);
+            for (int i = 0; i < wFrames; ++i) {
+                gw.push(ref, -10.f, true);
+                // Match Chain::push: after push(), output applies frame=talkFrames-1.
+                std::fill(buf, buf + 384, 1.f); gw.apply(buf, gw.gainTotal - 1, 2);
+                for (int q = 0; q < 384; ++q) if (std::abs(buf[q] - 1.f) > 1e-6f) {
+                    std::fprintf(stderr, "wake apply failed reset=%d frame=%d q=%d gain=%.9g\n", reset, i, q, buf[q]); return 1;
+                }
+            }
+            gw.push(ref, -10.f, false);
+        }
+        std::printf("PASS strict threshold, remote-active frame, opening ramp, >2^31 timeline, A/B/C wake apply stays 0 dB for W=0.5 s\n"); return 0;
     }
     if (argc != 4 || std::string(argv[1]) != "--dump") {
         std::fprintf(stderr, "usage: aec48_talk_gate --dump input output | --selftest\n"); return 2;

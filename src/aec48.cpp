@@ -188,7 +188,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.10.1 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.10.2 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -358,6 +358,14 @@ void aec48_destroy(Aec48* a) { if (!a) return; aec48_dump_stop(a); delete a; }
 // 仅供仓库自带的健壮性测试用（不在头文件里）：改下一次 dump_start 的录音队列容量（2 的幂），用来稳定复现"丢包超过上限"。
 __attribute__((visibility("default"))) void aec48_internal_set_dump_capacity(Aec48* a, unsigned long pow2) { if (a && pow2 >= 1024 && !(pow2 & (pow2 - 1))) a->dqCap = pow2; }
 #ifdef AEC48_TESTING
+// 双档唤醒自检：读取门的全局增益帧号与 apply() 使用的逐样本插值值。
+__attribute__((visibility("default"))) long long aec48_internal_talk_gate_frames(Aec48* a) {
+    return a && a->chain.cnet.hasTalkHead ? a->chain.talkGate.gainTotal : -1;
+}
+__attribute__((visibility("default"))) float aec48_internal_talk_gate_sample(Aec48* a, long long frame, int sample) {
+    if (!a || !a->chain.cnet.hasTalkHead || sample < 0 || sample >= a->H) return -1.f;
+    return a->chain.talkGate.gainAtSample(frame, sample);
+}
 // 仅供自检取出一次 process 的原始回调前样本；调用者保证缓冲区长度足够。
 __attribute__((visibility("default"))) void aec48_internal_set_prehook_capture(Aec48* a, float* output) {
     if (a) a->testPreCapture = output;

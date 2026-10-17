@@ -18,6 +18,19 @@
 #include <cmath>
 #include <cstring>
 
+// 双档切档：讲话那一路在唱歌档期间休眠，判断头状态会过时（实测切回后约 1.5–2 s 吃人声）。
+// 唤醒时（含从唱歌开流后第一次切到讲话）清零判断头 GRU（掩码主体不动），并让讲话门保持打开 AEC48_SWITCH_WAKE_MS，
+// 期间判断头照常推进、只靠掩码压回声；之后门按平滑规则正常收放。4000 ms 是 120 条 × 4 种切档日程按近端真值量到「零新增吃字」的最短值
+// （2000 ms 剩 16 窗、3000 ms 剩 2 窗）。模式 1 = 只强开门，3 = 另清门历史，仅供对照。
+#ifndef AEC48_SWITCH_WAKE_MODE
+#define AEC48_SWITCH_WAKE_MODE 2
+#endif
+#ifndef AEC48_SWITCH_WAKE_MS
+#define AEC48_SWITCH_WAKE_MS 4000
+#endif
+static_assert(AEC48_SWITCH_WAKE_MODE >= 1 && AEC48_SWITCH_WAKE_MODE <= 3, "invalid switch wake mode");
+static_assert(AEC48_SWITCH_WAKE_MS >= 0, "invalid switch wake duration");
+
 namespace ac {
 typedef std::complex<float> cf;
 
@@ -43,8 +56,11 @@ struct Chain {
     std::vector<float> moOther, accSing, accPSing, outSing, outTalk, preSing, preTalk;
     std::vector<cf> FXOther, FXPrimary, FXMixPre;
     float talkBlend = 1.f;
+    int blendPos = 0, blendN = 4;   // 切档交叉淡化：整数进度 0..blendN，blendN = ceil(0.3·sr/H)（48k 38 块 / 44.1k 35 块）
     bool singOLAActive = false, talkOLAActive = false;
     long long talkFrames = 0;
+    bool talkWasRunning = false;
+    int talkWakeFramesLeft = 0;
 #endif
     fb::TalkHighpass talkHpf;
     fb::TalkHighpass preTalkHpf;
@@ -140,12 +156,33 @@ struct Chain {
         }
 #ifdef AEC48_DUAL
         float blendStart = talkBlend;
-        if (k == 0) talkBlend = blendStart = profile == AEC48_PROFILE_TALK ? 1.f : 0.f;
-        else if (profile == AEC48_PROFILE_TALK) talkBlend = std::min(1.f, talkBlend + 0.25f);
-        else talkBlend = std::max(0.f, talkBlend - 0.25f);
+        if (k == 0) { blendN = std::max(1, (int)std::ceil(0.3 * sr / H)); blendPos = profile == AEC48_PROFILE_TALK ? blendN : 0; talkBlend = blendStart = profile == AEC48_PROFILE_TALK ? 1.f : 0.f; }
+        else {
+            // 约 300 ms 线性淡化；淡化没走完又切回时从当前进度往回走，端点精确为 0 / 1。
+            if (profile == AEC48_PROFILE_TALK) { if (blendPos < blendN) ++blendPos; } else if (blendPos > 0) --blendPos;
+            talkBlend = blendPos == blendN ? 1.f : blendPos == 0 ? 0.f : (float)blendPos / (float)blendN;
+        }
         const float frameBlend = 0.5f * (blendStart + talkBlend);
         const bool runTalk = blendStart > 0.f || talkBlend > 0.f;
         const bool runSing = blendStart < 1.f || talkBlend < 1.f;
+        if (k == 0) talkWasRunning = runTalk;
+        if (runTalk && !talkWasRunning) {
+            // A wake includes the first frame of a stream that starts in sing mode.
+#if AEC48_SWITCH_WAKE_MODE >= 2
+            cnet.resetTalkHead();
+#endif
+#if AEC48_SWITCH_WAKE_MODE >= 3
+            talkGate.resetHistory();
+#endif
+            talkGate.forceRecentOpen(3); // frame=talkFrames-1 reads gain frames G-3..G-1 on the first wake block
+            // Keep one interpolation endpoint past W: gain samples are joined at frame centers.
+            talkWakeFramesLeft = (int)std::ceil(AEC48_SWITCH_WAKE_MS * sr / (1000.0 * H)) + 1;
+        } else if (!runTalk) {
+            talkWakeFramesLeft = 0;
+        }
+        talkWasRunning = runTalk;
+        const bool wakeHoldOpen = talkWakeFramesLeft > 0;
+        if (wakeHoldOpen) --talkWakeFramesLeft;
         fb::Cofi& maskNet = profile == AEC48_PROFILE_TALK ? cnet : singNet;
         fb::Cofi& otherNet = profile == AEC48_PROFILE_TALK ? singNet : cnet;
         hint = runTalk;
@@ -220,7 +257,7 @@ struct Chain {
             if (runTalk && runSing) otherNet.step(se.data(), sy.data(), otherNet.hint ? sx.data() : nullptr, moOther.data());
             if (runTalk) {
                 talkGate.setThreshold(gateThreshold);
-                talkGate.push(rh.data() + N - 2 * H, cnet.lastTalk);
+                talkGate.push(rh.data() + N - 2 * H, cnet.lastTalk, wakeHoldOpen);
                 ++talkFrames;
                 talkFrameReady = true;
             }

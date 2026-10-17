@@ -1,5 +1,5 @@
 /*
- * aec48 0.10.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.10.2 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -32,7 +32,8 @@ typedef enum Aec48Profile {
 } Aec48Profile;
 
 /* 请求在下一个 384 样本处理块边界切换档位。dual 构建默认 TALK；可从任意线程调用。
- * 运行中用 4 块逐样本线性淡化；首次处理前选择 SING 则直接入档。
+ * 运行中用约 300 ms（ceil(0.3 × 采样率 / 384) 块）逐样本线性淡化；首次处理前选择 SING 则直接入档。
+ * 每次切入讲话档后的头 4 秒讲话门保持打开（判断头从零状态重新起跑，避免误压近端人声），之后正常收放。
  * 单档构建仅接受自身档位，其他值返回 -1。get 返回最近已生效档位。 */
 AEC48_EXPORT int aec48_set_profile(Aec48* a, int profile);
 AEC48_EXPORT int aec48_get_profile(const Aec48* a);
@@ -132,7 +133,7 @@ AEC48_EXPORT void aec48_set_spec_hook_enabled(Aec48* a, int on);
 /* 查询帧格式：采样率、窗长、帧移、窗型编号。串接方据此核对自己的格式，对不上就不要挂。 */
 AEC48_EXPORT void aec48_spec_format(const Aec48* a, int* sample_rate, int* nfft, int* hop, int* window_id);
 
-/* 版本与模型标识，例如 "aec48 0.10.0 (lin nlinBc3-dual, mask v59ae20)"。 */
+/* 版本与模型标识，例如 "aec48 0.10.2 (lin nlinBc3-dual, mask v59ae20)"。 */
 AEC48_EXPORT const char* aec48_version(void);
 
 #ifdef __cplusplus

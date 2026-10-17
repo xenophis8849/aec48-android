@@ -4,6 +4,65 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+#ifndef AEC48_SWITCH_WAKE_MS
+#define AEC48_SWITCH_WAKE_MS 500
+#endif
+#ifdef AEC48_TESTING
+extern "C" long long aec48_internal_talk_gate_frames(Aec48*);
+extern "C" float aec48_internal_talk_gate_sample(Aec48*, long long, int);
+
+static bool wakeSwitchApplySelftest(bool startInSing) {
+    Aec48* a = aec48_create(48000, 384); if (!a) return false;
+    bool ok = aec48_set_talk_gate(a, 1, 100.f) == 0;
+    float mic[384], ref[384], out[384];
+    auto process = [&](int block) {
+        for (int q = 0; q < 384; ++q) {
+            const int n = block * 384 + q;
+            // Voiced synthetic near-end input plus an active far-end reference.
+            mic[q] = .11f * std::sin(2.f * 3.14159265f * 230.f * n / 48000.f)
+                   + .04f * std::sin(2.f * 3.14159265f * 460.f * n / 48000.f);
+            ref[q] = .08f * std::sin(2.f * 3.14159265f * 173.f * n / 48000.f);
+        }
+        return aec48_process(a, mic, ref, out, 384) == 0;
+    };
+    int block = 0;
+    if (startInSing) ok &= aec48_set_profile(a, AEC48_PROFILE_SING) == 0;
+    else {
+        // Start in talk and make the retained gate state closed while the remote is active.
+        for (; block < 40 && ok; ++block) ok &= process(block);
+        ok &= aec48_set_profile(a, AEC48_PROFILE_SING) == 0;
+    }
+    // Talk inference and its gate sleep while near-end speech continues in singing mode.
+    for (int i = 0; i < 200 && ok; ++i, ++block) ok &= process(block);
+    const long long wakeFrame = aec48_internal_talk_gate_frames(a);
+    if (!startInSing) ok &= wakeFrame > 0;
+    ok &= aec48_set_profile(a, AEC48_PROFILE_TALK) == 0;
+    const int wFrames = (int)std::ceil(AEC48_SWITCH_WAKE_MS * 48000.0 / (1000.0 * 384));
+    bool woke = false; int checkedFrames = 0;
+    for (int i = 0; i < wFrames + 10 && ok; ++i, ++block) {
+        const long long before = aec48_internal_talk_gate_frames(a);
+        ok &= process(block);
+        const long long after = aec48_internal_talk_gate_frames(a);
+        if (after > before) {
+            if (!woke) { woke = true; ok &= after == before + 1 && before == wakeFrame; }
+            const long long wakeBlock = after - wakeFrame - 1;
+            if (wakeBlock >= 0 && wakeBlock < wFrames) {
+                // Chain::push applies after this block with frame=talkFrames-1.
+                const long long applyFrame = after - 1;
+                for (int q = 0; q < 384; ++q) {
+                    const float g = aec48_internal_talk_gate_sample(a, applyFrame, q);
+                    if (std::abs(g - 1.f) > 1e-6f) { ok = false; break; }
+                }
+                ++checkedFrames;
+            }
+        }
+    }
+    ok &= woke && checkedFrames == wFrames;
+    aec48_destroy(a);
+    return ok;
+}
+#endif
+
 static std::vector<float> run(bool bypass, bool gate, float threshold) {
     Aec48* a = aec48_create(48000, 384);
     if (!a) return {};
@@ -37,6 +96,16 @@ int main() {
         for (size_t i=1152;i<off.size();++i) { e+=double(off[i])*off[i]; double v=closed[i]-off[i]*.01f; d+=v*v; }
         ok &= d<1e-12*(e+1e-30);
     } else ok &= equal(off,closed);
-    std::printf("%s talk=%d: API/NaN/Inf/1152 latency/gate off/threshold/bypass\n",ok?"PASS":"FAIL",talk);
+#ifdef AEC48_TESTING
+    const bool dual = std::strstr(aec48_version(), "mask sing-") != nullptr;
+    if (dual) ok &= wakeSwitchApplySelftest(false) && wakeSwitchApplySelftest(true);
+#endif
+    std::printf("%s talk=%d: API/NaN/Inf/1152 latency/gate off/threshold/bypass%s\n",ok?"PASS":"FAIL",talk,
+#ifdef AEC48_TESTING
+                "/sing-to-talk W-window apply"
+#else
+                ""
+#endif
+    );
     return ok?0:1;
 }

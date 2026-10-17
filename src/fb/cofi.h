@@ -85,8 +85,9 @@ struct Cofi : HintV1 {
         h1.assign(mx, 0); hd.assign(mx, 0); yt.assign(mx, 0); sk0.assign(mx, 0); sk1.assign(mx, 0); sk2.assign(mx, 0); xf0.assign(mx, 0); xa.assign(mx, 0); xb.assign(mx, 0); xc.assign(mx, 0); xf.assign(mx, 0);
         gi.assign(3 * mx, 0); gh.assign(3 * mx, 0); yi.assign(mx, 0); z.assign(std::max(H, D), 0); z2.assign(D, 0); padr.assign(2 * mx + 16, 0); mF.assign(F, 0);
     }
+    void resetTalkHead() { if (hasTalkHead) { std::fill(talkH.begin(), talkH.end(), 0.f); lastTalk = -1.f; } }
     void reset() { for (auto& m : mb_) { std::fill(m.cache.begin(), m.cache.end(), 0.f); std::fill(m.h.begin(), m.h.end(), 0.f); m.head = 0; } for (auto& r : ir_) std::fill(r.h.begin(), r.h.end(), 0.f); std::fill(ch1.begin(), ch1.end(), 0.f); std::fill(ch2.begin(), ch2.end(), 0.f);
-        if (hint) resetHint(); if (hasTalkHead) { std::fill(talkH.begin(), talkH.end(), 0.f); lastTalk = -1.f; } }
+        if (hint) resetHint(); resetTalkHead(); }
     float talkStep(const float* feat) {
         if (!hasTalkHead) return lastTalk = -1.f;
         if (feat != talkZ.data()) memcpy(talkZ.data(), feat, 829 * sizeof(float)); float pre[32], gi[96], gh[96];
