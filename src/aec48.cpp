@@ -9,6 +9,9 @@
 #include "aec48.h"
 #include "aec_chain.h"
 #include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -71,6 +74,7 @@ struct Aec48 {
     ac::Chain chain; int sr = 48000, H = 384, prefill = 0, lat = 0;
     std::vector<float> inM, inR, blkO, blkP; int fill = 0; Ring outQ, outP;   // outP：回调前的输出，与 outQ 同步推、同步取
     std::atomic<int> enabled{1};
+    std::atomic<int> talkGateOn{1}; std::atomic<uint32_t> talkThresholdBits{0};
     std::vector<float> tmpO, tmpP;   // 取输出的中转（H 个，create 时分配）
     ac::SpecHook hook = nullptr; aec48_spec_hook2 hook2 = nullptr; void* hookUser = nullptr; std::atomic<int> hookOn{1}; std::atomic<int> inProc{0};
     int preDrain = 0;   // 摘掉回调后还要接着维护「回调前」那路的块数（重叠相加里残留着被回调改过的帧，4 块后两路才相等）
@@ -96,7 +100,9 @@ static void block(Aec48* a, const float* m, const float* r, long evPos) {
     // 「回调前」那路只在挂着回调、以及摘掉后的 4 块里维护（不挂回调的用户不付这份开销）；其余时候它就等于输出，直接拷。
     // 摘掉后马上重挂时状态仍在维护，不会从回调后的状态拷（Codex 审查 0.5 P2）
     const bool pre = a->hook || a->hook2 || a->preDrain > 0; if (!a->hook && !a->hook2 && a->preDrain > 0) --a->preDrain;
-    a->chain.push(m, r, a->blkO.data(), en ? 2 : 0, a->hook, a->hookUser, ho != 0, pre ? a->blkP.data() : nullptr, a->hook2, a->hookUser);
+    const uint32_t thresholdBits = a->talkThresholdBits.load(std::memory_order_relaxed); float threshold; memcpy(&threshold, &thresholdBits, sizeof(threshold));
+    a->chain.push(m, r, a->blkO.data(), en ? 2 : 0, a->hook, a->hookUser, ho != 0, pre ? a->blkP.data() : nullptr, a->hook2, a->hookUser,
+                  a->talkGateOn.load(std::memory_order_relaxed) != 0, threshold);
     if (!pre) memcpy(a->blkP.data(), a->blkO.data(), a->H * 4);
     a->outQ.push(a->blkO.data(), a->H);   // outQ 最多积压 prefill + H，远小于容量
     a->outP.push(a->blkP.data(), a->H);
@@ -158,7 +164,7 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.7.0 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.8.0 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
@@ -166,6 +172,7 @@ Aec48* aec48_create(int sample_rate, int frames_per_call) {
     try {
         std::call_once(g_reg, [] { fb::fb_register_model("lin", aec48_lin_model, aec48_lin_model_size); fb::fb_register_model("mask", aec48_mask_model, aec48_mask_model_size); });
         a = new Aec48(); a->sr = sample_rate;
+        { const float th = -3.0f; uint32_t bits; memcpy(&bits, &th, sizeof(bits)); a->talkThresholdBits.store(bits, std::memory_order_relaxed); }
         if (!a->chain.load("mem:lin", "mem:mask", sample_rate)) { delete a; return nullptr; }
         a->H = a->chain.H; a->inM.assign(a->H, 0.f); a->inR.assign(a->H, 0.f); a->blkO.assign(a->H, 0.f); a->outQ.init(1 << 13); a->outP.init(1 << 13); a->blkP.assign(a->H, 0.f);
         // 块长是 H 的整数倍时输入凑满一块立刻出一块，输出不会欠；否则先垫 H 个零，保证任何块长都不欠（延迟多一块）
@@ -180,6 +187,14 @@ Aec48* aec48_create(int sample_rate, int frames_per_call) {
 int aec48_latency_samples(const Aec48* a) { return a ? a->lat : 0; }
 
 void aec48_set_enabled(Aec48* a, int on) { if (a) a->enabled.store(on ? 1 : 0, std::memory_order_relaxed); }   // 只写原子量：可在音频线程调（录音事件由处理线程在生效的那一块记）
+
+int aec48_set_talk_gate(Aec48* a, int on, float threshold_logit) {
+    uint32_t bits; memcpy(&bits, &threshold_logit, sizeof(bits));
+    if (!a || !a->chain.cnet.hasTalkHead || (bits & 0x7f800000u) == 0x7f800000u) return -1;
+    a->talkThresholdBits.store(bits, std::memory_order_relaxed);
+    a->talkGateOn.store(on ? 1 : 0, std::memory_order_relaxed);
+    return 0;
+}
 
 int aec48_process(Aec48* a, const float* mic, const float* ref, float* out, int n) {
     if (!a || !mic || !ref || !out || n <= 0) return -1;
@@ -287,6 +302,18 @@ void aec48_destroy(Aec48* a) { if (!a) return; aec48_dump_stop(a); delete a; }
 // 仅供仓库自带的健壮性测试用（不在头文件里）：改下一次 dump_start 的录音队列容量（2 的幂），用来稳定复现"丢包超过上限"。
 __attribute__((visibility("default"))) void aec48_internal_set_dump_capacity(Aec48* a, unsigned long pow2) { if (a && pow2 >= 1024 && !(pow2 & (pow2 - 1))) a->dqCap = pow2; }
 #ifdef AEC48_TESTING
+// 仅供讲话版逐帧对账：829 维 talk 输入、logit，以及 769 个复数频点的交错复谱数组。
+// 每个复谱数组长度为 1538 float；无完整 talk 帧时返回 0。
+__attribute__((visibility("default"))) int aec48_internal_talk_snapshot(Aec48* a, float* talkInput829, float* logit1,
+        float* se, float* sy, float* sx, float* e, float* d) {
+    if (!a || !talkInput829 || !logit1 || !se || !sy || !sx || !e || !d || !a->chain.cnet.hasTalkHead || !a->chain.talkFrameReady) return 0;
+    const auto& c = a->chain;
+    memcpy(talkInput829, c.cnet.talkZ.data(), 829 * sizeof(float)); *logit1 = c.cnet.lastTalk;
+    memcpy(se, c.se.data(), 2 * c.F * sizeof(float)); memcpy(sy, c.sy.data(), 2 * c.F * sizeof(float));
+    memcpy(sx, c.sx.data(), 2 * c.F * sizeof(float));
+    for (int f = 0; f < c.F; ++f) { e[2 * f] = c.Er[f]; e[2 * f + 1] = c.Ei[f]; d[2 * f] = c.Dr[f]; d[2 * f + 1] = c.Di[f]; }
+    return c.F;
+}
 // 仅供仓库内测试：返回最近一帧按掩码归一尺度估计的提示功率、换算后的未缩放功率与 g²。
 __attribute__((visibility("default"))) int aec48_internal_hook2_hint_values(Aec48* a, double* normalized, double* unscaled, double* g2) {
     if (!a || !normalized || !unscaled || !g2 || a->chain.F <= 0) return 0;

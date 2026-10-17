@@ -10,6 +10,7 @@
 #include "fb/nlin.h"
 #include "fb/cofi.h"
 #include "aec48.h"
+#include "talk_gate.h"
 #include "pffft.h"
 #include <vector>
 #include <complex>
@@ -36,6 +37,8 @@ typedef void (*SpecHook)(void* user, float* re, float* im, int bins);
 
 struct Chain {
     fb::NlinD lin; fb::Cofi cnet; bool hasMask = false;
+    TalkGate talkGate;
+    bool talkFrameReady = false;
     int N = 0, H = 0, F = 0; RFft rf;
     bool hint = false; std::vector<float> rr, xaw, XAr, XAi, sx; long long nIn = 0; int lfAt[4] = {0, 0, 0, 0};   // 提示版：参考环形历史、对齐参考窗 / 谱
     fb::HintV1 sideHint; std::vector<float> sideResid, sideRhat, sidePowerNorm, sideEr, sideXr, rrSide; std::vector<unsigned char> farWin; int farWinN = 0, farWinAt = 0, farWinCount = 0, sideLfAt[4] = {0, 0, 0, 0}; long long sideBase = 0, sideNIn = 0; double farPeak = 0; bool sideWasOn = false;
@@ -48,6 +51,7 @@ struct Chain {
         lin.load(linPath); N = lin.N; H = lin.H; F = lin.F;
         lin.setDual(true, 0.2f, 3.f);                       // 双滤波器
         if (maskPath && maskPath[0]) { if (!fb::gtcHasKey(maskPath, "arch_cofi")) return false; cnet.load(maskPath, N); hasMask = true; }
+        if (cnet.hasTalkHead) { lin.TA = 0.98f; lin.TAd = 0.98; }
         if (!rf.init(N)) return false;
         hint = hasMask && cnet.hint;
         rr.assign((size_t)(lin.K + 8) * H, 0.f); xaw.assign(N, 0.f); XAr.assign(F, 0.f); XAi.assign(F, 0.f); sx.assign(2 * F, 0.f);
@@ -55,6 +59,7 @@ struct Chain {
         if (!cnet.hint) sideHint.init(F, N, sr, 48, 12, 0.7f, 0.5f, 0.3f);
         sideResid.assign(F, 0.f); sideRhat.assign(F, 0.f); sidePowerNorm.assign(F, 0.f); sideEr.assign(F, 0.f); sideXr.assign(F, 0.f);
         farWinN = (int)std::ceil(sr / H); farWin.assign(farWinN, 0); farWinAt = farWinCount = 0; farPeak = 0;
+        if (cnet.hasTalkHead) talkGate.init(H, (int)sampleRate);
         win.resize(N); for (int i = 0; i < N; ++i) win[i] = std::sqrt(0.5f * (1.f - std::cos(2.f * (float)M_PI * i / N)));
         mh.assign(N, 0.f); rh.assign(N, 0.f); xw.resize(N); dw.resize(N); Xr.resize(F); Xi.resize(F); Dr.resize(F); Di.resize(F); Er.resize(F); Ei.resize(F);
         se.resize(2 * F); sy.resize(2 * F); mo.resize(2 * F); FX.resize(N); acc.assign(N, 0.f); wacc.assign(N, 0.f);
@@ -68,7 +73,8 @@ struct Chain {
 
     // mic / ref：本块 H 个样本（±1 满幅）；out：H 个样本（= 4 块之前那块的处理结果）。
     // hook 非空时每帧调一次（hookOn = false 时跳过）；pre 非空时同时写出「回调前」的 H 个样本（与 out 同一时间轴）。
-    void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr, aec48_spec_hook2 hook2 = nullptr, void* user2 = nullptr) {
+    void push(const float* mic, const float* ref, float* out, int mode, SpecHook hook = nullptr, void* user = nullptr, bool hookOn = true, float* pre = nullptr, aec48_spec_hook2 hook2 = nullptr, void* user2 = nullptr, bool gateOn = true, float gateThreshold = -3.0f) {
+        talkFrameReady = false;
         const bool sideOn = hook2 && hookOn;
         if (sideOn && !sideWasOn) resetSideRefs();
         sideWasOn = sideOn;
@@ -106,6 +112,11 @@ struct Chain {
             for (int b = 0; b < F; ++b) { se[2 * b] = Er[b] * g; se[2 * b + 1] = Ei[b] * g; sy[2 * b] = (Dr[b] - Er[b]) * g; sy[2 * b + 1] = (Di[b] - Ei[b]) * g; }
             if (hint) for (int b = 0; b < F; ++b) { sx[2 * b] = XAr[b] * g; sx[2 * b + 1] = XAi[b] * g; }
             cnet.step(se.data(), sy.data(), hint ? sx.data() : nullptr, mo.data());
+            if (cnet.hasTalkHead) {
+                talkGate.setThreshold(gateThreshold);
+                talkGate.push(rh.data() + N - 2 * H, cnet.lastTalk);
+                talkFrameReady = true;
+            }
             const float ig = 1.f / g; for (int b = 0; b < F; ++b) FX[b] = cf(mo[2 * b] * ig, mo[2 * b + 1] * ig);
             if (Pg < 0) { if (p > 1e-8) Pg = p; } else Pg += GA * (p - Pg);
         }
@@ -153,7 +164,9 @@ struct Chain {
         for (int q = 0; q < N; ++q) { acc[q] += xw[q] * win[q]; wacc[q] += win[q] * win[q]; }
         if (pre && !anyHook) for (int q = 0; q < N; ++q) accP[q] += xw[q] * win[q];       // 回调没调：回调前 = 回调后
         for (int q = 0; q < H; ++q) out[q] = wacc[q] > 1e-8f ? acc[q] / wacc[q] : 0.f;
+        if (cnet.hasTalkHead && gateOn) talkGate.apply(out, k - 2, mode);
         if (pre) for (int q = 0; q < H; ++q) pre[q] = wacc[q] > 1e-8f ? accP[q] / wacc[q] : 0.f;
+        if (cnet.hasTalkHead && gateOn && pre) talkGate.apply(pre, k - 2, mode);
         memmove(acc.data(), acc.data() + H, (N - H) * 4); memset(acc.data() + N - H, 0, H * 4);
         if (pre) { memmove(accP.data(), accP.data() + H, (N - H) * 4); memset(accP.data() + N - H, 0, H * 4); }
         memmove(wacc.data(), wacc.data() + H, (N - H) * 4); memset(wacc.data() + N - H, 0, H * 4);

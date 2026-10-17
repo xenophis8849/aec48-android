@@ -30,6 +30,9 @@ struct Cofi : HintV1 {
     MB mb_[8]; IR ir_[4]; GRU cg1, cg2; const float *f1w, *f1b, *f2w, *f2b, *clw, *clb; float cle; int H = 0, D = 0; std::vector<float> ch1, ch2;
     const float *erb = nullptr, *ierb = nullptr; std::vector<int> es, ee, is, ie;
     std::vector<float> em, ym, rh, lm, xc0, xc9, xf7, xf21, h1, hd, yt, sk0, sk1, sk2, xf0, xa, xb, xc, xf, gi, gh, yi, z, z2, mF; std::vector<float> padr;   // 深度卷积补零缓冲
+    // Talk gru2 head: cr2/fr2 输出特征缓存与循环状态，仅带 talk_head2_v1 的参数包启用。
+    bool hasTalkHead = false; float lastTalk = -1.f; std::vector<float> talkZ, talkH;
+    const float *talkW1 = nullptr, *talkB1 = nullptr, *talkWih = nullptr, *talkWhh = nullptr, *talkBi = nullptr, *talkBh = nullptr, *talkW2 = nullptr, *talkB2 = nullptr;
 
     const Ten& T(const std::string& k) const { auto it = P.find(k); if (it == P.end()) { fprintf(stderr, "cofi: 缺参数 %s\n", k.c_str()); fb_fail(); } return it->second; }
     const float* p(const std::string& k) const { return T(k).v.data(); }
@@ -39,7 +42,12 @@ struct Cofi : HintV1 {
         ModelFile mf_(fb_open_model(path)); FILE* f = mf_.f; if (!f) { perror(path); fb_fail(); } char mg[4]; int cnt; Gtcrn::rd(mg, 1, 4, f); Gtcrn::rd(&cnt, 4, 1, f); if (memcmp(mg, "GTC1", 4)) die("文件格式错");
         for (int i = 0; i < cnt; ++i) { int nl, nd; Gtcrn::rd(&nl, 4, 1, f); std::string k(nl, ' '); Gtcrn::rd(&k[0], 1, nl, f); Gtcrn::rd(&nd, 4, 1, f); Ten t; t.d.resize(nd); if (nd) Gtcrn::rd(t.d.data(), 4, nd, f); size_t n = 1; for (int x : t.d) n *= x; t.v.resize(n); if (n) Gtcrn::rd(t.v.data(), 4, n, f); P[k] = std::move(t); }
         mf_.close(); T("arch_cofi"); F = nfft / 2 + 1; floorDb = floor_;
-        hint = P.count("hint_v1") > 0;
+        hint = P.count("hint_v1") > 0; hasTalkHead = P.count("talk_head2_v1") > 0;
+        if (hasTalkHead) {
+            const Ten& w1 = T("talk_head2.0.weight"); const Ten& wih = T("talk_head2.2.weight_ih_l0");
+            if (w1.d.size() != 2 || w1.d[0] != 32 || w1.d[1] != 829 || wih.d.size() != 2 || wih.d[0] != 96 || wih.d[1] != 32 || T("talk_head2.2.weight_hh_l0").v.size() != 96 * 32 || T("talk_head2.3.weight").v.size() != 32) die("talk_head2 形状不符");
+            talkW1 = p("talk_head2.0.weight"); talkB1 = p("talk_head2.0.bias"); talkWih = p("talk_head2.2.weight_ih_l0"); talkWhh = p("talk_head2.2.weight_hh_l0"); talkBi = p("talk_head2.2.bias_ih_l0"); talkBh = p("talk_head2.2.bias_hh_l0"); talkW2 = p("talk_head2.3.weight"); talkB2 = p("talk_head2.3.bias"); talkZ.assign(829, 0.f); talkH.assign(32, 0.f);
+        }
         if (hint) { const Ten& hbT = T("hint_band"); const Ten& hp = T("hint_par"); if ((int)hbT.v.size() != F || hp.v.size() < 5) die("hint 参数形状不符");
             const int nb = (int)hp.v[0], K = (int)hp.v[1]; if (nb <= 0 || K < 1) die("hint 参数无效");
             std::vector<int> bands(F); for (int f = 0; f < F; ++f) { bands[f] = (int)hbT.v[f]; if (bands[f] < 0 || bands[f] >= nb) die("hint 带号越界"); }
@@ -78,7 +86,14 @@ struct Cofi : HintV1 {
         gi.assign(3 * mx, 0); gh.assign(3 * mx, 0); yi.assign(mx, 0); z.assign(std::max(H, D), 0); z2.assign(D, 0); padr.assign(2 * mx + 16, 0); mF.assign(F, 0);
     }
     void reset() { for (auto& m : mb_) { std::fill(m.cache.begin(), m.cache.end(), 0.f); std::fill(m.h.begin(), m.h.end(), 0.f); m.head = 0; } for (auto& r : ir_) std::fill(r.h.begin(), r.h.end(), 0.f); std::fill(ch1.begin(), ch1.end(), 0.f); std::fill(ch2.begin(), ch2.end(), 0.f);
-        if (hint) resetHint(); }
+        if (hint) resetHint(); if (hasTalkHead) { std::fill(talkH.begin(), talkH.end(), 0.f); lastTalk = -1.f; } }
+    float talkStep(const float* feat) {
+        if (!hasTalkHead) return lastTalk = -1.f;
+        if (feat != talkZ.data()) memcpy(talkZ.data(), feat, 829 * sizeof(float)); float pre[32], gi[96], gh[96];
+        for (int o = 0; o < 32; ++o) { float a = talkB1[o]; const float* w = talkW1 + (size_t)o * 829; for (int i = 0; i < 829; ++i) a += w[i] * talkZ[i]; pre[o] = a > 0.f ? a : std::expm1(a); }
+        for (int g = 0; g < 96; ++g) { float a = talkBi[g], b = talkBh[g]; const float* wi = talkWih + (size_t)g * 32; const float* wh = talkWhh + (size_t)g * 32; for (int i = 0; i < 32; ++i) { a += wi[i] * pre[i]; b += wh[i] * talkH[i]; } gi[g] = a; gh[g] = b; }
+        Gtcrn::gruGates(gi, gh, talkH.data(), 32, 1); float logit = talkB2[0]; for (int i = 0; i < 32; ++i) logit += talkW2[i] * talkH[i]; return lastTalk = logit;
+    }
 
     // AffinePReLU：y = aw·x + ab + (x>0 ? x : s_c·x)，x [C][N] 原地
     static void aprelu(float* x, int C, int N, const float* aw, const float* ab, const float* s) {
@@ -174,6 +189,7 @@ struct Cofi : HintV1 {
         memcpy(&xc[0], &sk2[0], nc * 4); memcpy(&xf[0], &xf0[0], nf * 4); inter(ir_[0], &xc[0]); inter(ir_[2], &xf[0]); PT(3);
         cpf(&xc[0], nc, &xf[0], nf); PT(4);
         inter(ir_[1], &xc[0]); inter(ir_[3], &xf[0]); PT(3);
+        if (hasTalkHead) { memcpy(talkZ.data(), xc.data(), nc * 4); memcpy(talkZ.data() + nc, xf.data(), nf * 4); }
         for (int i = 0; i < nc; ++i) xc[i] += sk2[i]; mb(mb_[4], &xc[0], &xa[0]);
         { const int n = mb_[4].C * mb_[4].Fo; for (int i = 0; i < n; ++i) xa[i] += sk1[i]; } mb(mb_[5], &xa[0], &xb[0]);
         { const int n = mb_[5].C * mb_[5].Fo; for (int i = 0; i < n; ++i) xb[i] += sk0[i]; } mb(mb_[6], &xb[0], &xa[0]); PT(5);   // xa = 粗路输出 (1, 129)
@@ -182,6 +198,12 @@ struct Cofi : HintV1 {
         memcpy(&mF[0], &xa[0], F0 * 4); for (int r = 0; r < Fh; ++r) { float s = 0; const float* wr = ierb + r * 64; for (int k = is[r]; k < ie[r]; ++k) s += wr[k] * xa[F0 + k]; mF[F0 + r] = s; }
         for (int f = 0; f < FL; ++f) mF[f] *= res(xb[f]);
         const float lo = floorDb > 0 ? std::pow(10.f, -floorDb / 20.f) : -1e30f;
+        if (hasTalkHead) {
+            float* ol = talkZ.data() + 700; const int Fh = F - F0;
+            for (int f = 0; f < F0; ++f) ol[f] = std::log10(std::max(em[f] * std::max(mF[f], lo), 1e-8f));
+            for (int r = 0; r < 64; ++r) { float a = 0.f; const float* wr = erb + r * Fh; for (int k = es[r]; k < ee[r]; ++k) a += wr[k] * em[F0 + k] * std::max(mF[F0 + k], lo); ol[F0 + r] = std::log10(std::max(a, 1e-8f)); }
+            talkStep(talkZ.data());
+        }
         for (int f = 0; f < F; ++f) { const float g = std::max(mF[f], lo); out[2 * f] = se[2 * f] * g; out[2 * f + 1] = se[2 * f + 1] * g; }
         PT(7);
     }

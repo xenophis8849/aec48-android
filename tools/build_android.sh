@@ -1,14 +1,21 @@
 #!/usr/bin/env bash
-# 编 Android 库：默认版 prebuilt/<ABI>/libaec48.so，候选版 prebuilt/candidate-v62b/<ABI>/libaec48.so（arm64-v8a、armeabi-v7a）；另编手机上跑的自检程序 build-android-<ABI>[-v62b]/aec48_check。
+# 编 Android 库：默认 prebuilt/<ABI>、候选 prebuilt/candidate-v62b/<ABI>、讲话 prebuilt/talk/<ABI>。
 # 需要 NDK（r26 以上；本仓库的预编译包用 r28）：ANDROID_NDK=/path/to/ndk tools/build_android.sh
 set -eu; cd "$(dirname "$0")/.."; NDK=${ANDROID_NDK:?请设 ANDROID_NDK}
-for fl in default v62b; do
-  if [ $fl = default ]; then M=src/models.cpp; SUF=""; OUT=prebuilt; else M=src/models_$fl.cpp; SUF=-$fl; OUT=prebuilt/candidate-$fl; fi
+# 可传 default / v62b / talk，仅重建所选档；无参数仍构建全部。
+if [ "$#" -eq 0 ]; then set -- default v62b talk; fi
+for profile in "$@"; do
+  case $profile in
+    default) M=src/models.cpp; SUF=""; OUT=prebuilt ;;
+    v62b) M=src/models_v62b.cpp; SUF=-v62b; OUT=prebuilt/candidate-v62b ;;
+    talk) M=src/models_talk.cpp; SUF=-talk; OUT=prebuilt/talk ;;
+    *) echo "未知档：$profile" >&2; exit 2 ;;
+  esac
   for abi in arm64-v8a armeabi-v7a; do
     cmake -S . -B build-android-$abi$SUF -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-21 \
       -DANDROID_STL=c++_static -DCMAKE_BUILD_TYPE=Release -DAEC48_BUILD_CHECK=ON -DAEC48_MODELS=$M > /dev/null
-    cmake --build build-android-$abi$SUF -j4 > /dev/null
+    cmake --build build-android-$abi$SUF -j${AEC48_BUILD_JOBS:-2} > /dev/null
     mkdir -p $OUT/$abi; cp build-android-$abi$SUF/libaec48.so $OUT/$abi/
-    echo "$fl $abi：$OUT/$abi/libaec48.so（$(stat -c %s $OUT/$abi/libaec48.so) 字节）"
+    echo "$profile $abi：$OUT/$abi/libaec48.so（$(stat -c %s $OUT/$abi/libaec48.so) 字节）"
   done
 done

@@ -15,6 +15,7 @@
 | `include/aec48.h` | 全部接口（C） |
 | `prebuilt/arm64-v8a/libaec48.so`、`prebuilt/armeabi-v7a/libaec48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
 | `prebuilt/candidate-v62b/<ABI>/libaec48.so` | 候选版预编译库（0.6 起，掩码 v62be20；接口与默认版相同，见「候选版」） |
+| `prebuilt/talk/<ABI>/libaec48.so` | 讲话版：t2ae10 掩码、e1be12 gru2 判断头与默认开启的平滑门 |
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型，`models_v62b.cpp` 候选版内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
@@ -48,10 +49,32 @@ target_link_libraries(your_audio aec48)
 - 区分版本：`aec48_version()` 返回 `aec48 0.6.0 (lin nlinBc3-dual, mask v62be20 candidate)`，录音的 `meta.json` 的 `version` 同此，回传的录音可据此分辨用的是哪一版。
 - 库文件大小、内存与默认版基本相同（arm64 2.0 MB；每个实例多约 0.3 MB）。
 
+### 讲话档
+
+将 `prebuilt/talk/<ABI>/libaec48.so` 放入工程即可使用讲话档；主机或父工程构建时选择 `-DAEC48_MODELS=src/models_talk.cpp`。版本标识为 `lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2`。掩码来自 t2a e10，小出口来自 e1b e12（主体 317 个共享张量逐位一致）；时延跟踪系数为 0.98，唱歌档保留 0.995。讲话档用于语音场景，唱歌场景继续选默认或候选档。
+
+讲话门默认开启，默认 logit 门限为 −3.0。可以在音频线程调用：
+
+```c
+aec48_set_talk_gate(a, 1, -3.0f);  /* 开门控，设置判断门限 */
+aec48_set_talk_gate(a, 0, -3.0f);  /* 关闭门控，保留讲话模型输出 */
+```
+
+讲话版成功返回 0；非讲话版、空实例或非有限门限返回 −1。开关和门限通过原子量更新，在处理块边界生效，不加锁、不分配。`aec48_set_enabled(a, 0)` 直通时门不作用，内部模型与门状态继续更新。
+
+48 kHz 下每 384 样本判断一次：原始参考块均方超过绝对 −70 dBFS 视为远端有声，并保留过去 125 帧；判断头 logit 严格大于门限视为近端讲话，并保留过去 31 帧（均含当前帧）。仅在远端有声而未判近端讲话时，目标增益为 −40 dB；其余为 0 dB。dB 域开启每帧最多 +32 dB、关闭每帧最多 −2.13333 dB，初值取第一帧目标。转线性后按帧中心 `t*384+192` 逐样本插值，乘在时域合成输出上；不增加原有 1152 样本延迟。44.1 kHz 下保持长度和斜率随实际采样率换算。
+
+频谱回调发生在时域门之前；第 2 版回调的 `near_talk` 字段仍为 −1，不向联动降噪库发布讲话判断结果。唱歌档的输出不受新增接口影响。
+
+判断头为 32,929 参数，理论额外约 4 MMAC/s（x86 主机实测每块多约 0.006 ms）。判断头与门已与离线参考实现逐帧对齐（logit 最大差 7e-6，门增益最大差 7e-8）；整链输出的合成方式与唱歌档相同（逐帧反归一后合成）。
+
+模型导出：`tools/export_talk.py`（需 PyTorch，把讲话掩码与判断头合成一个参数包），再运行 `tools/embed_models.py models/lin_nlinBc3.gtc models/mask_talk.gtc "lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2" src/models_talk.cpp`。时延系数在讲话链加载后覆盖，通用线性模型文件保持原值。
+
 ### 从源码编译
 
 ```sh
-ANDROID_NDK=/path/to/ndk tools/build_android.sh      # 产出默认版 prebuilt/<ABI>/ 与候选版 prebuilt/candidate-v62b/<ABI>/（arm64-v8a、armeabi-v7a）
+ANDROID_NDK=/path/to/ndk tools/build_android.sh      # 产出默认、候选、讲话三档，两种 ABI
+ANDROID_NDK=/path/to/ndk tools/build_android.sh talk # 只重建讲话档；AEC48_BUILD_JOBS 可设构建并发数，默认 2
 ```
 
 也可以直接把本仓库作为子目录 `add_subdirectory()` 进自己的 CMake 工程（目标名 `aec48`）；要候选版时先设 `set(AEC48_MODELS src/models_v62b.cpp)` 或在命令行加 `-DAEC48_MODELS=src/models_v62b.cpp`。

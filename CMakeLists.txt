@@ -25,7 +25,7 @@ target_compile_options(kleidiai PRIVATE -O3)
 target_compile_definitions(kleidiai PRIVATE NDEBUG)
 set_target_properties(kleidiai PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# 内嵌模型：默认 src/models.cpp（掩码 v59ae20）；0.6 起候选版 -DAEC48_MODELS=src/models_v62b.cpp（掩码 v62be20，接口与默认版完全相同）
+# 内嵌模型：默认 models.cpp；候选 models_v62b.cpp；讲话 models_talk.cpp（均在 src/）。
 # 父工程先 set(AEC48_MODELS …) 再 add_subdirectory 时保留它（cmake_minimum_required 3.18 下 CMP0126 为 OLD，直接建同名缓存项会把普通变量清掉）
 if(NOT DEFINED AEC48_MODELS)
   set(AEC48_MODELS src/models.cpp CACHE STRING "内嵌模型源文件（tools/embed_models.py 生成）")
@@ -55,6 +55,11 @@ if(AEC48_BUILD_CHECK OR NOT ANDROID)
   add_executable(aec48_hint test/aec48_hint.cpp)
   target_include_directories(aec48_hint PRIVATE src)
   target_compile_options(aec48_hint PRIVATE -O3 -ffast-math)
+  add_executable(aec48_talk_gate test/aec48_talk_gate.cpp)
+  target_include_directories(aec48_talk_gate PRIVATE src)
+  target_compile_options(aec48_talk_gate PRIVATE -O3)
+  add_executable(aec48_talk_api test/aec48_talk_api.cpp)
+  target_link_libraries(aec48_talk_api PRIVATE aec48)
   # 私有观测口只进自检构建，不进对外头文件或发布库。
   option(AEC48_TESTING "启用频谱提示的私有自检观测口" OFF)
   if(AEC48_TESTING)

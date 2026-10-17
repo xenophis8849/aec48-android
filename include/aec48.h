@@ -1,5 +1,5 @@
 /*
- * aec48 0.7.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.8.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -41,6 +41,10 @@ AEC48_EXPORT int aec48_process_s16(Aec48* a, const short* mic, const short* ref,
 /* 1 = 回声消除开（默认）；0 = 直通（输出麦克风原声，延迟不变，便于 A/B 对比）。下一块生效。只写原子量，可在音频线程调。
  * 关闭期间线性级与掩码照常运行、只是不用其输出，所以切回开时立即是正常状态，无需重新收敛；代价是关闭时算力不省。 */
 AEC48_EXPORT void aec48_set_enabled(Aec48* a, int on);
+
+/* 讲话模型的交付门。讲话版默认开启；threshold_logit 比较口径为 talk head 原始 logit。
+ * 可在任意线程调用，包括音频线程；只写原子量、不加锁、不分配。讲话版返回 0；非讲话版或空实例返回 -1。 */
+AEC48_EXPORT int aec48_set_talk_gate(Aec48* a, int on, float threshold_logit);
 
 /* out 相对 mic 的固定延迟（样本数）。 */
 AEC48_EXPORT int aec48_latency_samples(const Aec48* a);
