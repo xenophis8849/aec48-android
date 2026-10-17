@@ -1,5 +1,5 @@
 /*
- * aec48 0.8.1 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
+ * aec48 0.9.0 —— 实时全带回声消除（48 kHz / 44.1 kHz，单声道）
  *
  * 用法（每一路采集流一个实例）：
  *   Aec48* a = aec48_create(48000, 384);          // 采样率；每次 process 的样本数（384 的整数倍延迟最低）
@@ -7,7 +7,7 @@
  *   aec48_destroy(a);
  *
  * 线程：一个实例的 process 只能在同一个线程里调（不加锁、不分配内存、不做文件读写，可以放在音频回调里）；
- *       aec48_set_enabled / aec48_set_spec_hook_enabled 只写一个原子量（不加锁、不分配），可以在任意线程调，包括音频线程；aec48_dump_* 可以在任意线程调（会加锁，不要在音频线程里调）。
+ *       aec48_set_enabled / aec48_set_profile / aec48_set_spec_hook_enabled 只写原子量（不加锁、不分配），可以在任意线程调，包括音频线程；aec48_dump_* 可以在任意线程调（会加锁，不要在音频线程里调）。
  * 数据：float，满幅 ±1.0，单声道。mic 与 ref 必须是同一个采样率、同样多的样本。
  * 延迟：out 比 mic 晚 aec48_latency_samples() 个样本（48k、块长为 384 的整数倍时 1152 = 24 ms；其他块长 1536 = 32 ms）。
  */
@@ -24,6 +24,18 @@ extern "C" {
 #endif
 
 typedef struct Aec48 Aec48;
+
+/* 0.9.0 双档构建的处理档位。单档构建只接受与自身匹配的值。 */
+typedef enum Aec48Profile {
+    AEC48_PROFILE_SING = 0,
+    AEC48_PROFILE_TALK = 1
+} Aec48Profile;
+
+/* 请求在下一个 384 样本处理块边界切换档位。dual 构建默认 TALK；可从任意线程调用。
+ * 运行中用 4 块逐样本线性淡化；首次处理前选择 SING 则直接入档。
+ * 单档构建仅接受自身档位，其他值返回 -1。get 返回最近已生效档位。 */
+AEC48_EXPORT int aec48_set_profile(Aec48* a, int profile);
+AEC48_EXPORT int aec48_get_profile(const Aec48* a);
 
 /* sample_rate：48000 或 44100。frames_per_call：之后每次 process 的样本数（会变就填 0）。
  * 失败（参数不支持、内存不足、模型初始化失败）返回 NULL；库不会退出宿主进程。多线程同时创建多个实例是安全的。 */
@@ -42,8 +54,9 @@ AEC48_EXPORT int aec48_process_s16(Aec48* a, const short* mic, const short* ref,
  * 关闭期间线性级与掩码照常运行、只是不用其输出，所以切回开时立即是正常状态，无需重新收敛；代价是关闭时算力不省。 */
 AEC48_EXPORT void aec48_set_enabled(Aec48* a, int on);
 
-/* 讲话模型的交付门。讲话版默认开启；threshold_logit 比较口径为 talk head 原始 logit。
- * 可在任意线程调用，包括音频线程；只写原子量、不加锁、不分配。讲话版返回 0；非讲话版或空实例返回 -1。 */
+/* 讲话模型的交付门。讲话版及 dual 版默认开启；threshold_logit 比较口径为 talk head 原始 logit。
+ * dual 的唱歌档不施门，但门设置保留到下次讲话档。可在任意线程调用，包括音频线程；只写原子量、不加锁、不分配。
+ * 讲话版及 dual 版返回 0；其他单档版或空实例返回 -1。 */
 AEC48_EXPORT int aec48_set_talk_gate(Aec48* a, int on, float threshold_logit);
 
 /* out 相对 mic 的固定延迟（样本数）。 */

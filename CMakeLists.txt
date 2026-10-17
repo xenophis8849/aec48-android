@@ -25,12 +25,16 @@ target_compile_options(kleidiai PRIVATE -O3)
 target_compile_definitions(kleidiai PRIVATE NDEBUG)
 set_target_properties(kleidiai PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# 内嵌模型：默认 models.cpp；候选 models_v62b.cpp；讲话 models_talk.cpp（均在 src/）。
+# 内嵌模型：默认 models.cpp；候选 models_v62b.cpp；讲话 models_talk.cpp；双档 models_dual.cpp。
 # 父工程先 set(AEC48_MODELS …) 再 add_subdirectory 时保留它（cmake_minimum_required 3.18 下 CMP0126 为 OLD，直接建同名缓存项会把普通变量清掉）
 if(NOT DEFINED AEC48_MODELS)
   set(AEC48_MODELS src/models.cpp CACHE STRING "内嵌模型源文件（tools/embed_models.py 生成）")
 endif()
 add_library(aec48 SHARED src/aec48.cpp ${AEC48_MODELS})
+get_filename_component(AEC48_MODELS_NAME "${AEC48_MODELS}" NAME)
+if(AEC48_MODELS_NAME STREQUAL "models_dual.cpp")
+  target_compile_definitions(aec48 PRIVATE AEC48_DUAL)
+endif()
 target_include_directories(aec48 PUBLIC include PRIVATE src)
 # 与端上核对版 chain_d 同编译选项：-O3 -ffast-math，时延估计用 float
 target_compile_options(aec48 PRIVATE -O3 -ffast-math -fvisibility=hidden)
@@ -60,6 +64,8 @@ if(AEC48_BUILD_CHECK OR NOT ANDROID)
   target_compile_options(aec48_talk_gate PRIVATE -O3)
   add_executable(aec48_talk_api test/aec48_talk_api.cpp)
   target_link_libraries(aec48_talk_api PRIVATE aec48)
+  add_executable(aec48_profile test/aec48_profile.cpp)
+  target_link_libraries(aec48_profile PRIVATE aec48)
   # 私有观测口只进自检构建，不进对外头文件或发布库。
   option(AEC48_TESTING "启用频谱提示的私有自检观测口" OFF)
   if(AEC48_TESTING)
@@ -68,6 +74,7 @@ if(AEC48_BUILD_CHECK OR NOT ANDROID)
   endif()
   if(NOT ANDROID)
     target_link_libraries(aec48_robust PRIVATE pthread)
+    target_link_libraries(aec48_profile PRIVATE pthread)
     # 内存分配失败注入：借 glibc 的 __libc_malloc 转发，只在能链接到它的 Linux 主机上编（macOS、musl 跳过）
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
       include(CheckCSourceCompiles)

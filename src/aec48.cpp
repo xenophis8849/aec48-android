@@ -27,7 +27,13 @@
 #include <unistd.h>
 
 extern "C" { extern const unsigned char aec48_lin_model[]; extern const unsigned long aec48_lin_model_size;
-             extern const unsigned char aec48_mask_model[]; extern const unsigned long aec48_mask_model_size; extern const char aec48_model_id[]; }
+#ifdef AEC48_DUAL
+             extern const unsigned char aec48_sing_mask_model[]; extern const unsigned long aec48_sing_mask_model_size;
+             extern const unsigned char aec48_talk_mask_model[]; extern const unsigned long aec48_talk_mask_model_size;
+#else
+             extern const unsigned char aec48_mask_model[]; extern const unsigned long aec48_mask_model_size;
+#endif
+             extern const char aec48_model_id[]; }
 
 namespace {
 struct Ring {   // 单生产单消费、无锁
@@ -74,6 +80,7 @@ struct Aec48 {
     ac::Chain chain; int sr = 48000, H = 384, prefill = 0, lat = 0;
     std::vector<float> inM, inR, blkO, blkP; int fill = 0; Ring outQ, outP;   // outP：回调前的输出，与 outQ 同步推、同步取
     std::atomic<int> enabled{1};
+    std::atomic<int> requestedProfile{AEC48_PROFILE_TALK}, activeProfile{AEC48_PROFILE_TALK};
     std::atomic<int> talkGateOn{1}; std::atomic<uint32_t> talkThresholdBits{0};
     std::vector<float> tmpO, tmpP;   // 取输出的中转（H 个，create 时分配）
     ac::SpecHook hook = nullptr; aec48_spec_hook2 hook2 = nullptr; void* hookUser = nullptr; std::atomic<int> hookOn{1}; std::atomic<int> inProc{0};
@@ -101,8 +108,14 @@ static void block(Aec48* a, const float* m, const float* r, long evPos) {
     // 摘掉后马上重挂时状态仍在维护，不会从回调后的状态拷（Codex 审查 0.5 P2）
     const bool pre = a->hook || a->hook2 || a->preDrain > 0; if (!a->hook && !a->hook2 && a->preDrain > 0) --a->preDrain;
     const uint32_t thresholdBits = a->talkThresholdBits.load(std::memory_order_relaxed); float threshold; memcpy(&threshold, &thresholdBits, sizeof(threshold));
+#ifdef AEC48_DUAL
+    const int profile = a->requestedProfile.load(std::memory_order_relaxed);
+    a->activeProfile.store(profile, std::memory_order_relaxed);
+#else
+    const int profile = a->activeProfile.load(std::memory_order_relaxed);
+#endif
     a->chain.push(m, r, a->blkO.data(), en ? 2 : 0, a->hook, a->hookUser, ho != 0, pre ? a->blkP.data() : nullptr, a->hook2, a->hookUser,
-                  a->talkGateOn.load(std::memory_order_relaxed) != 0, threshold);
+                  a->talkGateOn.load(std::memory_order_relaxed) != 0, threshold, profile);
     if (!pre) memcpy(a->blkP.data(), a->blkO.data(), a->H * 4);
     a->outQ.push(a->blkO.data(), a->H);   // outQ 最多积压 prefill + H，远小于容量
     a->outP.push(a->blkP.data(), a->H);
@@ -164,16 +177,31 @@ template <class In, class Out> static int run(Aec48* a, const In& in, const Out&
 }
 
 extern "C" {
-const char* aec48_version(void) { static std::string v = std::string("aec48 0.8.1 (") + aec48_model_id + ")"; return v.c_str(); }
+const char* aec48_version(void) { static std::string v = std::string("aec48 0.9.0 (") + aec48_model_id + ")"; return v.c_str(); }
 
 Aec48* aec48_create(int sample_rate, int frames_per_call) {
     if (sample_rate != 48000 && sample_rate != 44100) return nullptr;
     Aec48* a = nullptr;
     try {
-        std::call_once(g_reg, [] { fb::fb_register_model("lin", aec48_lin_model, aec48_lin_model_size); fb::fb_register_model("mask", aec48_mask_model, aec48_mask_model_size); });
+        std::call_once(g_reg, [] {
+            fb::fb_register_model("lin", aec48_lin_model, aec48_lin_model_size);
+#ifdef AEC48_DUAL
+            fb::fb_register_model("sing_mask", aec48_sing_mask_model, aec48_sing_mask_model_size);
+            fb::fb_register_model("talk_mask", aec48_talk_mask_model, aec48_talk_mask_model_size);
+#else
+            fb::fb_register_model("mask", aec48_mask_model, aec48_mask_model_size);
+#endif
+        });
         a = new Aec48(); a->sr = sample_rate;
         { const float th = -3.0f; uint32_t bits; memcpy(&bits, &th, sizeof(bits)); a->talkThresholdBits.store(bits, std::memory_order_relaxed); }
+#ifdef AEC48_DUAL
+        if (!a->chain.load("mem:lin", "mem:talk_mask", sample_rate, "mem:sing_mask")) { delete a; return nullptr; }
+#else
         if (!a->chain.load("mem:lin", "mem:mask", sample_rate)) { delete a; return nullptr; }
+        const int ownProfile = a->chain.cnet.hasTalkHead ? AEC48_PROFILE_TALK : AEC48_PROFILE_SING;
+        a->requestedProfile.store(ownProfile, std::memory_order_relaxed);
+        a->activeProfile.store(ownProfile, std::memory_order_relaxed);
+#endif
         a->H = a->chain.H; a->inM.assign(a->H, 0.f); a->inR.assign(a->H, 0.f); a->blkO.assign(a->H, 0.f); a->outQ.init(1 << 13); a->outP.init(1 << 13); a->blkP.assign(a->H, 0.f);
         // 块长是 H 的整数倍时输入凑满一块立刻出一块，输出不会欠；否则先垫 H 个零，保证任何块长都不欠（延迟多一块）
         a->prefill = (frames_per_call > 0 && frames_per_call % a->H == 0) ? 0 : a->H;
@@ -187,6 +215,17 @@ Aec48* aec48_create(int sample_rate, int frames_per_call) {
 int aec48_latency_samples(const Aec48* a) { return a ? a->lat : 0; }
 
 void aec48_set_enabled(Aec48* a, int on) { if (a) a->enabled.store(on ? 1 : 0, std::memory_order_relaxed); }   // 只写原子量：可在音频线程调（录音事件由处理线程在生效的那一块记）
+
+int aec48_set_profile(Aec48* a, int profile) {
+    if (!a || (profile != AEC48_PROFILE_SING && profile != AEC48_PROFILE_TALK)) return -1;
+#ifndef AEC48_DUAL
+    if (profile != a->activeProfile.load(std::memory_order_relaxed)) return -1;
+#endif
+    a->requestedProfile.store(profile, std::memory_order_relaxed);
+    return 0;
+}
+
+int aec48_get_profile(const Aec48* a) { return a ? a->activeProfile.load(std::memory_order_relaxed) : -1; }
 
 int aec48_set_talk_gate(Aec48* a, int on, float threshold_logit) {
     uint32_t bits; memcpy(&bits, &threshold_logit, sizeof(bits));
@@ -274,7 +313,7 @@ int aec48_set_spec_hook(Aec48* a, aec48_spec_hook fn, void* user) {
     if (!a) return -1;
     if (a->inProc.load(std::memory_order_acquire) > 0) return -2;   // 正在 process：拒绝（尽力检测，约定上调用方保证不并发）
     std::lock_guard<std::mutex> lk(a->dmu); if (a->dumping.load()) return -3;   // 录音中不换挂钩：out_prehook 的有无在录音开始时定
-    if (fn && !a->hook && !a->hook2 && a->preDrain == 0) a->chain.accP = a->chain.acc;   // 已 ≥4 块没挂回调：两路的重叠相加状态本来就相等
+    if (fn && !a->hook && !a->hook2 && a->preDrain == 0) a->chain.syncPreAcc();   // 已 ≥4 块没挂回调：两路的重叠相加状态本来就相等
     if (!fn && (a->hook || a->hook2)) a->preDrain = 4;
     a->hook = fn; a->hook2 = nullptr; a->hookUser = fn ? user : nullptr; return 0;
 }
@@ -283,7 +322,7 @@ int aec48_set_spec_hook2(Aec48* a, aec48_spec_hook2 fn, void* user) {
     if (!a) return -1;
     if (a->inProc.load(std::memory_order_acquire) > 0) return -2;
     std::lock_guard<std::mutex> lk(a->dmu); if (a->dumping.load()) return -3;
-    if (fn) { a->chain.resetSide(); if (!a->hook && !a->hook2 && a->preDrain == 0) a->chain.accP = a->chain.acc; }
+    if (fn) { a->chain.resetSide(); if (!a->hook && !a->hook2 && a->preDrain == 0) a->chain.syncPreAcc(); }
     if (!fn && (a->hook || a->hook2)) a->preDrain = 4;
     a->hook2 = fn; a->hook = nullptr; a->hookUser = fn ? user : nullptr; return 0;
 }
@@ -323,7 +362,7 @@ __attribute__((visibility("default"))) int aec48_internal_hook2_hint_values(Aec4
 }
 // 仅供仓库内默认版测试：核对递推器实际收到的带内功率与处理链本帧 g² 输入。
 __attribute__((visibility("default"))) int aec48_internal_hook2_scaled_inputs(Aec48* a) {
-    if (!a || a->chain.cnet.hint) return -1;
+    if (!a || a->chain.sideNetHint) return -1;
     const auto& c = a->chain; if (c.sideHint.hNB > 48) return -1;
     float pe[48] = {}, px[48] = {}; const float g2 = c.sideLastG * c.sideLastG;
     for (int f = 0; f < c.F; ++f) { const int b = c.sideHint.hb[f]; pe[b] += (c.Er[f] * c.Er[f] + c.Ei[f] * c.Ei[f]) * g2; px[b] += (c.XAr[f] * c.XAr[f] + c.XAi[f] * c.XAi[f]) * g2; }
@@ -332,12 +371,12 @@ __attribute__((visibility("default"))) int aec48_internal_hook2_scaled_inputs(Ae
 }
 // 仅供仓库内候选版测试：逐 float 位比较实际保存的归一提示功率与 Cofi hm²。
 __attribute__((visibility("default"))) int aec48_internal_hook2_hint_exact(Aec48* a) {
-    if (!a || !a->chain.cnet.hint) return -1;
+    if (!a || !a->chain.sideNetHint) return -1;
     int n = 0; for (int f = 0; f < a->chain.F; ++f) { const float p = a->chain.cnet.hm[f] * a->chain.cnet.hm[f]; n += memcmp(&a->chain.sidePowerNorm[f], &p, sizeof(float)) != 0; }
     return n;
 }
 __attribute__((visibility("default"))) int aec48_internal_hook2_hint_error(Aec48* a, double out2[2]) {
-    if (!a || !out2 || !a->chain.cnet.hint) return 0;
+    if (!a || !out2 || !a->chain.sideNetHint) return 0;
     double ma = 0, mp = 0;
     const float g2f = a->chain.sideLastG * a->chain.sideLastG;
     for (int f = 0; f < a->chain.F; ++f) {

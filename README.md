@@ -16,6 +16,7 @@
 | `prebuilt/arm64-v8a/libaec48.so`、`prebuilt/armeabi-v7a/libaec48.so` | 预编译库（NDK r28，minSdk 21，c++_static） |
 | `prebuilt/candidate-v62b/<ABI>/libaec48.so` | 候选版预编译库（0.6 起，掩码 v62be20；接口与默认版相同，见「候选版」） |
 | `prebuilt/talk/<ABI>/libaec48.so` | 讲话版：t2ae10 掩码、e1be12 gru2 判断头与默认开启的平滑门 |
+| `prebuilt/dual/<ABI>/libaec48.so` | 双档版：一份线性级、唱歌与讲话两套掩码，可在通话中切档 |
 | `src/` | 源码（`aec48.cpp` 接口实现，`aec_chain.h` 处理链，`fb/` 推理内核，`models.cpp` 内嵌模型，`models_v62b.cpp` 候选版内嵌模型） |
 | `android/src/com/karaoke/aec48/Aec48Uploader.java` | 录音上传工具（可配置上传地址与库名） |
 | `example/duplex_example.cpp` | AAudio 全双工接入示例 |
@@ -46,7 +47,7 @@ target_link_libraries(your_audio aec48)
 
 - 候选版的掩码多用两路输入：参考信号按线性级估出的时延挪齐后的频谱，以及由它与线性级输出算出的残余回声估计。两路都在库内部从已有的 `mic` / `ref` 算出，接入方不需要多提供任何数据。
 - 效果：回声为主的时段残留更少（测试向量见「自检」：远端单讲整段消除量 8.2 → 13.0 dB）。
-- 区分版本：`aec48_version()` 返回 `aec48 0.6.0 (lin nlinBc3-dual, mask v62be20 candidate)`，录音的 `meta.json` 的 `version` 同此，回传的录音可据此分辨用的是哪一版。
+- 区分版本：当前 `aec48_version()` 返回 `aec48 0.9.0 (lin nlinBc3-dual, mask v62be20 candidate)`，录音的 `meta.json` 的 `version` 同此，回传的录音可据此分辨用的是哪一版。
 - 库文件大小、内存与默认版基本相同（arm64 2.0 MB；每个实例多约 0.3 MB）。
 
 ### 讲话档
@@ -60,7 +61,7 @@ aec48_set_talk_gate(a, 1, -3.0f);  /* 开门控，设置判断门限 */
 aec48_set_talk_gate(a, 0, -3.0f);  /* 关闭门控，保留讲话模型输出 */
 ```
 
-讲话版成功返回 0；非讲话版、空实例或非有限门限返回 −1。开关和门限通过原子量更新，在处理块边界生效，不加锁、不分配。`aec48_set_enabled(a, 0)` 直通时门不作用，内部模型与门状态继续更新。
+讲话版和双档版成功返回 0；其他单档版、空实例或非有限门限返回 −1。开关和门限通过原子量更新，在处理块边界生效，不加锁、不分配。`aec48_set_enabled(a, 0)` 直通时门不作用，内部活跃模型与门状态继续更新。
 
 48 kHz 下每 384 样本判断一次：原始参考块均方超过绝对 −70 dBFS 视为远端有声，并保留过去 125 帧；判断头 logit 严格大于门限视为近端讲话，并保留过去 31 帧（均含当前帧）。仅在远端有声而未判近端讲话时，目标增益为 −40 dB；其余为 0 dB。dB 域开启每帧最多 +32 dB、关闭每帧最多 −2.13333 dB，初值取第一帧目标。转线性后按帧中心 `t*384+192` 逐样本插值，乘在时域合成输出上；不增加原有 1152 样本延迟。44.1 kHz 下保持长度和斜率随实际采样率换算。
 
@@ -70,11 +71,32 @@ aec48_set_talk_gate(a, 0, -3.0f);  /* 关闭门控，保留讲话模型输出 */
 
 模型导出：`tools/export_talk.py`（需 PyTorch，把讲话掩码与判断头合成一个参数包），再运行 `tools/embed_models.py models/lin_nlinBc3.gtc models/mask_talk.gtc "lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2" src/models_talk.cpp`。时延系数在讲话链加载后覆盖，通用线性模型文件保持原值。
 
+### 双档库与通话中切档
+
+0.9.0 的双档版使用 `prebuilt/dual/<ABI>/libaec48.so`，SONAME 为 `libaec48.so`，接入只需这一份库。源码构建选择 `-DAEC48_MODELS=src/models_dual.cpp`；内嵌 `lin_nlinBc3` 线性模型、`v59ae20` 唱歌掩码，以及带 `e1be12-gru2` 判断头的 `talk-t2ae10` 讲话掩码。创建后默认为讲话档。
+
+```c
+aec48_set_profile(a, AEC48_PROFILE_SING); /* 0：唱歌 */
+aec48_set_profile(a, AEC48_PROFILE_TALK); /* 1：讲话 */
+int active = aec48_get_profile(a);
+```
+
+`aec48_set_profile` 成功返回 0，空实例、非法档位或单档库不支持的档位返回 −1。默认版和候选版只支持 SING，讲话单档版只支持 TALK。设置只写原子量，可在任意线程调用，在下一个内部 384 样本块边界生效；同一边界前多次设置，以最后一次为准。`aec48_get_profile` 返回已生效的目标档位，淡化期间可能仍混有上一档输出，空实例返回 −1。在首次处理前设置唱歌档会直接起步，不做淡化。
+
+切档共用并保留同一个线性级的自适应滤波器与时延历史，仅改变时延跟踪系数（讲话 0.98、唱歌 0.995）。两套掩码各自保存循环状态，休眠期间冻结，再次激活时继续；讲话门历史也随讲话分支冻结和恢复。双档版在唱歌档仍接受 `aec48_set_talk_gate` 并保留设置，唱歌输出不施门。提示和切档缓冲在创建时分配，处理期间不分配内存、不加锁。
+
+切档用 4 个 384 样本块逐样本线性淡化（48 kHz 下 32 ms，44.1 kHz 下约 34.83 ms）。四块内同时计算两套掩码，讲话分支先施门，再按 `out = (1-w)*sing + w*talk` 混合；线性级只计算一次。快速反切从当前混合权重继续过渡。休眠分支唤醒时借用当前输出分支的重叠相加尾巴，避免空缓冲造成音量缺口；掩码和讲话门状态保持原样。休眠分支未处理期间的音频上下文不会补算。
+
+频谱回调仍每帧只调用一次，交叉期间接收按该帧中点权重混合的门前频谱。修改得到的逐频点复数增益同时作用于两条合成支路，恒等与置零分别保留原谱和静音；混合谱功率不超过 `1e-24` 时，两路直接采用回调结果，避免除以接近零的值。`hook2` 的 `near_talk` 仍为 −1，算法延迟和帧格式不变。常态只运行所选掩码，端上需要给 4 块的双掩码计算预留余量。
+
+主机 x86_64、48 kHz / 384 样本、默认门开启的 30 s 合成单讲测试中，常态每块平均约 0.099 ms，8 个淡化块平均约 0.174 ms、峰值约 0.209 ms（C 接口调用墙钟时间）。这些数值用于说明短暂的计算增量，Android 真机耗时须另测。固定档位已在两种采样率与 float / int16 下和对应单档版逐字节核对；切换后的状态历史不同于从头运行目标档，因此不保证两者输出相同。
+
 ### 从源码编译
 
 ```sh
-ANDROID_NDK=/path/to/ndk tools/build_android.sh      # 产出默认、候选、讲话三档，两种 ABI
+ANDROID_NDK=/path/to/ndk tools/build_android.sh      # 产出默认、候选、讲话、双档，两种 ABI
 ANDROID_NDK=/path/to/ndk tools/build_android.sh talk # 只重建讲话档；AEC48_BUILD_JOBS 可设构建并发数，默认 2
+ANDROID_NDK=/path/to/ndk tools/build_android.sh dual # 只重建双档版
 ```
 
 也可以直接把本仓库作为子目录 `add_subdirectory()` 进自己的 CMake 工程（目标名 `aec48`）；要候选版时先设 `set(AEC48_MODELS src/models_v62b.cpp)` 或在命令行加 `-DAEC48_MODELS=src/models_v62b.cpp`。
@@ -434,7 +456,8 @@ adb shell 'cd /data/local/tmp/aec48 && LD_LIBRARY_PATH=. taskset <核心掩码> 
 
 ## 版本与模型
 
-- 当前：默认版 `aec48 0.7.0 (lin nlinBc3-dual, mask v59ae20)`；候选版 `aec48 0.7.0 (lin nlinBc3-dual, mask v62be20 candidate)`。
+- 当前版本：0.9.0。默认版标识 `lin nlinBc3-dual, mask v59ae20`；候选版 `lin nlinBc3-dual, mask v62be20 candidate`；讲话版 `lin nlinBc3-dual, mask talk-t2ae10 + head e1be12-gru2`；双档版 `lin nlinBc3-dual, mask sing-v59ae20 + talk-t2ae10 + head e1be12-gru2`。
+- 0.9.0：新增双档库与 `aec48_set_profile` / `aec48_get_profile`，保留线性级与独立掩码状态，4 块逐样本交叉淡化。双档默认讲话；单档库只接受自身档位。默认、候选、讲话版的处理输出与 0.8.1 逐字节一致，频谱回调契约仍为 2。
 - 0.7.0 修改 **【联动】**（默认版、候选版处理结果不变）：频谱回调契约升至 2，增加 `aec48_set_spec_hook2` 与 `Aec48SpecSide`，每帧提供处理模式、远端活动和残余回声功率；近端说话概率暂不提供。第 1 版回调行为不变，旧二进制不受影响；重编时契约检查应接受 `AEC48_SPEC_CONTRACT_VERSION >= 1`。录音 `meta.json` 的 `spec_hook` 增加 `contract_version`。
 - 0.6 修改（默认版处理结果不变：三个测试向量输出与 0.5.2 逐字节相同；接口、延迟、频谱回调契约不变，契约版本仍为 1）：
   - 新增候选版预编译库 `prebuilt/candidate-v62b/`（见「快速开始 · 候选版」）。掩码内核支持带「残余回声提示」的模型（参数文件带 `hint_v1` 时自动启用），处理链为它多算一路对齐参考频谱（每块多一次 FFT）。

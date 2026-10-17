@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# 编 Android 库：默认 prebuilt/<ABI>、候选 prebuilt/candidate-v62b/<ABI>、讲话 prebuilt/talk/<ABI>。
+# 编 Android 库：默认、候选、讲话、双档（prebuilt/dual/<ABI>）。
 # 需要 NDK（r26 以上；本仓库的预编译包用 r28）：ANDROID_NDK=/path/to/ndk tools/build_android.sh
 set -eu; cd "$(dirname "$0")/.."; NDK=${ANDROID_NDK:?请设 ANDROID_NDK}
-# 可传 default / v62b / talk，仅重建所选档；无参数仍构建全部。
-if [ "$#" -eq 0 ]; then set -- default v62b talk; fi
+# 可传 default / v62b / talk / dual，仅重建所选档；无参数仍构建全部。
+if [ "$#" -eq 0 ]; then set -- default v62b talk dual; fi
 for profile in "$@"; do
   case $profile in
     default) M=src/models.cpp; SUF=""; OUT=prebuilt ;;
     v62b) M=src/models_v62b.cpp; SUF=-v62b; OUT=prebuilt/candidate-v62b ;;
     talk) M=src/models_talk.cpp; SUF=-talk; OUT=prebuilt/talk ;;
+    dual) M=src/models_dual.cpp; SUF=-dual; OUT=prebuilt/dual ;;
     *) echo "未知档：$profile" >&2; exit 2 ;;
   esac
   for abi in arm64-v8a armeabi-v7a; do

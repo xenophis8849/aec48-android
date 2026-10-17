@@ -18,7 +18,8 @@ static std::vector<float> run(bool bypass, bool gate, float threshold) {
 }
 int main() {
     Aec48* a=aec48_create(48000,384); if (!a) return 1;
-    const bool talk=std::strstr(aec48_version(),"mask talk-")!=nullptr;
+    const bool talk=std::strstr(aec48_version(),"mask talk-")!=nullptr ||
+                    std::strstr(aec48_version(),"mask sing-")!=nullptr; // dual 创建后为讲话档
     bool ok=aec48_set_talk_gate(nullptr,1,-2.75f)==-1;
     ok &= aec48_set_talk_gate(a,1,-2.75f)==(talk?0:-1);
     ok &= aec48_set_talk_gate(a,1,std::numeric_limits<float>::infinity())==-1;
